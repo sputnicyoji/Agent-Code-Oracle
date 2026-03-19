@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+.dedup_cache.json
+oracle-sync-report.json
+.env
+*.egg-info/
+dist/
+build/
+.pytest_cache/

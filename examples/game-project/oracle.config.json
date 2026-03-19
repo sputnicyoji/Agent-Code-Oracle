@@ -1,0 +1,39 @@
+{
+  "_comment": "Example oracle.config.json for a game project. Replace module paths and names with your own.",
+  "project_name": "ExampleGame",
+  "file_extension": ".cs",
+  "scanned_modules": {
+    "BattleEngine": {
+      "source_root": "src/BattleEngine/",
+      "contract_output": "docs/contracts/battle-engine.json",
+      "_note": "Core combat simulation — high blast radius, scan first"
+    },
+    "CityBuilder": {
+      "source_root": "src/CityBuilder/",
+      "contract_output": "docs/contracts/city-builder.json",
+      "_note": "City construction and resource management"
+    },
+    "EventBus": {
+      "source_root": "src/Core/EventBus/",
+      "contract_output": "docs/contracts/event-bus.json",
+      "_note": "Cross-module event system — ordering and threading constraints"
+    },
+    "PlayerInventory": {
+      "source_root": "src/Player/Inventory/",
+      "contract_output": "docs/contracts/player-inventory.json"
+    }
+  },
+  "repomap_l3": ".claude/context/repomap-L3-relations.md",
+  "sync_report": ".claude/context/oracle-sync-report.json",
+  "embedding": {
+    "enabled": false,
+    "model": "bge-m3",
+    "ollama_url": "http://localhost:11434"
+  },
+  "quality_gate": {
+    "min_effective_contracts": 10,
+    "min_p0_p1_ratio": 0.5,
+    "max_total_contracts": 30,
+    "confidence_threshold": 0.5
+  }
+}

@@ -1,0 +1,47 @@
+[
+  {
+    "type": "blast_radius",
+    "title": "PaymentGateway output affects OrderService and InvoiceGenerator",
+    "description": "PaymentGateway processes payment results that are consumed by OrderService for order fulfillment and InvoiceGenerator for receipt creation",
+    "blind_spot": "Modifying payment result structure only considers PaymentGateway internals",
+    "violation_consequence": "OrderService fails to process orders, InvoiceGenerator generates corrupt invoices",
+    "involved_files": ["PaymentGateway.cs", "OrderService.cs", "InvoiceGenerator.cs"],
+    "confidence": 0.95
+  },
+  {
+    "type": "rationale",
+    "title": "EventBus uses synchronous dispatch intentionally",
+    "description": "EventBus dispatches events synchronously despite async being available to ensure ordering guarantees",
+    "blind_spot": "Developer may convert to async for performance without understanding ordering requirement",
+    "violation_consequence": "Event ordering breaks, causing race conditions in dependent handlers",
+    "involved_files": ["EventBus.cs", "EventDispatcher.cs"],
+    "confidence": 0.88
+  },
+  {
+    "type": "data_flow",
+    "title": "UserSession flows through auth pipeline with validity window",
+    "description": "UserSession data is only valid during request lifecycle, cached in RequestContext",
+    "blind_spot": "Accessing UserSession outside request lifecycle returns stale data",
+    "violation_consequence": "Stale session data causes permission check failures",
+    "involved_files": ["AuthMiddleware.cs", "SessionStore.cs", "RequestContext.cs"],
+    "confidence": 0.85
+  },
+  {
+    "type": "ordering",
+    "title": "DatabaseMigration must complete before SchemaValidator runs",
+    "description": "SchemaValidator reads the schema version set by DatabaseMigration",
+    "blind_spot": "Reordering init sequence seems safe but breaks schema validation",
+    "violation_consequence": "SchemaValidator reads old schema version, reports false errors",
+    "involved_files": ["DatabaseMigration.cs", "SchemaValidator.cs"],
+    "confidence": 0.82
+  },
+  {
+    "type": "thread_safety",
+    "title": "ConnectionPool uses lock-free ConcurrentQueue",
+    "description": "ConnectionPool chose ConcurrentQueue over simple List for thread safety",
+    "blind_spot": "Replacing ConcurrentQueue with List for simplicity introduces race conditions",
+    "violation_consequence": "Connection leaks and double-disposal under concurrent access",
+    "involved_files": ["ConnectionPool.cs"],
+    "confidence": 0.78
+  }
+]

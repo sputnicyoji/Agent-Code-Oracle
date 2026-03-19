@@ -1,0 +1,43 @@
+#!/bin/sh
+#
+# Code Oracle post-merge hook
+#
+# Runs the freshness checker after each git merge to flag contracts
+# that may be stale due to code changes.
+#
+# Install:
+#   cp hooks/post-merge .git/hooks/post-merge
+#   chmod +x .git/hooks/post-merge
+#
+# Configuration: reads oracle.config.json from repo root.
+# Non-blocking: always exits 0. Stale contracts are reported, not errors.
+#
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+CONFIG="$REPO_ROOT/oracle.config.json"
+
+if [ ! -f "$CONFIG" ]; then
+    exit 0
+fi
+
+# Check Python is available
+if ! command -v python3 >/dev/null 2>&1; then
+    if ! command -v python >/dev/null 2>&1; then
+        exit 0
+    fi
+    PYTHON=python
+else
+    PYTHON=python3
+fi
+
+FRESHNESS_SCRIPT="$REPO_ROOT/scripts/freshness_checker.py"
+
+if [ ! -f "$FRESHNESS_SCRIPT" ]; then
+    exit 0
+fi
+
+echo "[Code Oracle] Running freshness check after merge..."
+$PYTHON "$FRESHNESS_SCRIPT" --config "$CONFIG" --since-merge 2>/dev/null
+
+# Always exit 0 — freshness check is advisory, not a gate
+exit 0

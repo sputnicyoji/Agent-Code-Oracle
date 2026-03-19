@@ -1,0 +1,21 @@
+{
+  "project_name": "MyProject",
+  "file_extension": ".cs",
+  "scanned_modules": {
+    "PaymentService": {
+      "source_root": "src/PaymentService/",
+      "contract_output": "docs/contracts/payment-service.json"
+    },
+    "UserAuth": {
+      "source_root": "src/UserAuth/",
+      "contract_output": "docs/contracts/user-auth.json"
+    }
+  },
+  "repomap_l3": ".claude/context/repomap-L3-relations.md",
+  "sync_report": ".claude/context/oracle-sync-report.json",
+  "embedding": {
+    "enabled": true,
+    "model": "bge-m3",
+    "ollama_url": "http://localhost:11434"
+  }
+}

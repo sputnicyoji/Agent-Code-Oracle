@@ -1,0 +1,28 @@
+[project]
+name = "agent-code-oracle"
+version = "4.1.0"
+description = "Extract implicit code contracts that AI coding agents can't discover on their own"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [{name = "Yoji"}]
+keywords = ["ai", "coding-agent", "code-contracts", "knowledge-graph", "blast-radius"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Quality Assurance",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+]
+
+[project.urls]
+Homepage = "https://github.com/sputnicyoji/Agent-Code-Oracle"
+Issues = "https://github.com/sputnicyoji/Agent-Code-Oracle/issues"
+
+[project.scripts]
+oracle-pipeline = "scripts.pipeline:main"
+oracle-scan = "scripts.incremental_scanner:main"
+oracle-sync = "scripts.oracle_sync:main"
+oracle-fresh = "scripts.freshness_checker:main"
