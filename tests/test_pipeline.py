@@ -50,6 +50,11 @@ def _make_kg_injector_stub() -> types.ModuleType:
     mod = types.ModuleType("kg_injector")
 
     class KGInjector:
+        def __init__(self, *args, **kwargs):
+            # Accept any constructor args so pipeline can pass
+            # emit_legacy_keys / future flags without breaking the stub.
+            pass
+
         def convert(self, contracts, module_name):
             return {
                 "entities": [{"name": c["title"]} for c in contracts],

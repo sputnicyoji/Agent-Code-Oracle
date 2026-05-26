@@ -1,0 +1,23 @@
+[
+  {
+    "schema_version": 2,
+    "type": "blast_radius",
+    "title": "BaseController is consumed by request handlers",
+    "description": "BaseController is the abstract root; concrete handlers inherit it",
+    "blind_spot": "Refactoring its signature breaks every handler",
+    "violation_consequence": "Request routing fails across the app",
+    "involved": [{"path": "Controllers.cs"}],
+    "evidence": [{"kind": "static_reference", "source": "grep", "target": "Controllers.cs"}],
+    "confidence": 0.9
+  },
+  {
+    "schema_version": 2,
+    "type": "rationale",
+    "title": "IRepository encapsulates persistence boundary",
+    "description": "All persistence is mediated through IRepository implementations",
+    "blind_spot": "Bypassing it leaks DB types into business logic",
+    "violation_consequence": "DB swap requires rewriting consumers",
+    "involved": [{"path": "Repositories.cs"}],
+    "confidence": 0.85
+  }
+]

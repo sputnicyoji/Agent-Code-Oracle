@@ -71,6 +71,33 @@ Stage 5: KG Injection Format        — convert to knowledge graph entities/rela
 The pipeline has **zero external dependencies** in its base mode. Ollama with `bge-m3`
 is optional for enhanced semantic deduplication.
 
+### Graph Providers (Stage 0)
+
+Stage 0 enriches contracts with cross-module consumer information. Two providers
+ship; the choice is made via `oracle.config.json -> graph_provider.type`:
+
+| Provider | Setup | Strengths | Tradeoffs |
+|----------|-------|-----------|-----------|
+| `repomap_l3` | Generate a [RepoMap](https://github.com/paul-gauthier/aider) L3 markdown file once | Carries relation type (`inherits`/`implements`/`calls`); fast at scan time | Needs the L3 index up-to-date |
+| `grep_fallback` | None — uses `git grep` / `rg` / `grep` already on the system | Zero-install, works on any repo immediately | Slower; every edge has `relation_type = "reference"`; `internal_symbols > 500` triggers a warning |
+
+`ctags_universal` is a planned third option (same shape as `grep_fallback`, but
+backed by a tags index). See [plans/phase-e-experience.md](plans/phase-e-experience.md).
+
+Example config for `grep_fallback`:
+
+```jsonc
+{
+  "graph_provider": {
+    "type": "grep_fallback",
+    "include_dirs": ["src/"]
+  }
+}
+```
+
+Paths in `oracle.config.json` resolve against the config file's directory, not the
+caller's cwd, so the same config works from any working directory.
+
 ### Persistence via Knowledge Graph
 
 Extracted contracts are stored as entities in a knowledge graph (compatible with

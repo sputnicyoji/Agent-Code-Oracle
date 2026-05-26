@@ -1,0 +1,7 @@
+{
+  "project_name": "grep_smoke",
+  "graph_provider": {
+    "type": "grep_fallback",
+    "include_dirs": ["multi_class_module"]
+  }
+}

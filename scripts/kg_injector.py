@@ -23,6 +23,19 @@ class KGInjector:
 
     KG_CONTEXT = "code_contracts"
 
+    def __init__(self, emit_legacy_keys: bool = False):
+        """
+        Args:
+            emit_legacy_keys: when True, additionally emit the pre-v4.2
+                aggregated `[involved_files] a, b, c` and
+                `[affected_external_files] ...` observation lines so a KG
+                populated with old-format entries can still be queried with
+                old patterns during a transition window. The new
+                `[involved] <path>` lines are emitted unconditionally; this
+                flag only controls the legacy duplicates.
+        """
+        self.emit_legacy_keys = emit_legacy_keys
+
     def convert(self, contracts: list[dict], module_name: str) -> dict:
         """
         Convert contracts to KG injection format
@@ -52,12 +65,27 @@ class KGInjector:
                 f"[module] {module_name}",
             ]
 
-            # Store filenames in observations (aim_search_nodes only searches observations)
-            if involved:
-                observations.append(f"[involved_files] {', '.join(involved)}")
+            # Store filenames as one observation per path. Previously every
+            # involved file was joined with ', ' into a single observation
+            # line. That made aim_search_nodes' substring match return the
+            # whole aggregated line for any one path hit, dragging in 9
+            # unrelated paths per search result. One-line-per-path keeps
+            # the search-result granularity at "one path".
+            for path in involved:
+                observations.append(f"[involved] {path}")
+            for path in affected:
+                observations.append(f"[affected_external] {path}")
             if affected:
-                observations.append(f"[affected_external_files] {', '.join(affected)}")
                 observations.append(f"[external_consumer_count] {len(affected)}")
+
+            # Legacy aggregated keys, opt-in. Keeps queries written against
+            # pre-v4.2 KG entries working during a migration window.
+            if self.emit_legacy_keys:
+                if involved:
+                    observations.append(f"[involved_files] {', '.join(involved)}")
+                if affected:
+                    observations.append(f"[affected_external_files] {', '.join(affected)}")
+
             if c.get("_l3_enriched"):
                 observations.append("[repomap_verified] Cross-module consumers verified by AST")
             if c.get("evidence"):

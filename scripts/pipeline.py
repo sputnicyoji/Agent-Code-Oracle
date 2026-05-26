@@ -14,6 +14,7 @@ CLI:
 """
 
 import json
+import os
 import sys
 import argparse
 from pathlib import Path
@@ -57,10 +58,17 @@ class OraclePipeline:
                  exclude: list[str] = None, quality_gate: dict = None,
                  quality_gate_profiles: dict = None,
                  profile: str = "auto",
+                 emit_legacy_kg_keys: bool = False,
+                 graph_provider: dict = None,
+                 repo_root_for_grep: str = None,
                  allow_warn: bool = False):
         self.module_name = module_name
         self.source_root = source_root
         self.repomap_l3 = repomap_l3
+        # Full provider config (type + provider-specific options). When set,
+        # supersedes the bare `repomap_l3` path argument.
+        self.graph_provider = graph_provider or {}
+        self.repo_root_for_grep = repo_root_for_grep
         # Base gate; per-profile overrides apply lazily in process() once we
         # know the auto-selected profile.
         self.quality_gate = dict(DEFAULT_QUALITY_GATE)
@@ -76,7 +84,7 @@ class OraclePipeline:
         )
         self.dedup = SemanticDedup(threshold=dedup_threshold)
         self.blind_spot_filter = BlindSpotFilter()
-        self.injector = KGInjector()
+        self.injector = KGInjector(emit_legacy_keys=emit_legacy_kg_keys)
         # Populated by Stage 0 when it runs; consumed by _compute_stats and
         # the quality-gate profile auto-selector. Empty dict means Stage 0
         # was skipped (no repomap_l3 configured).
@@ -103,11 +111,14 @@ class OraclePipeline:
         # Defensive copy to avoid mutating caller's data
         contracts = [dict(c) for c in contracts]
 
-        # Stage 0: L3 Cross-Module Injection (optional)
-        if self.repomap_l3:
-            print("[0/5] L3 Cross-Module Injection...")
-            from repomap_bridge import RepoMapBridge
-            bridge = RepoMapBridge(self.repomap_l3)
+        # Stage 0: Cross-Module Enrichment via configured provider.
+        # `_make_provider` returns repomap_l3 / grep_fallback / None based on
+        # graph_provider config; backward-compatible with the legacy
+        # `repomap_l3` path argument when no provider config is supplied.
+        bridge = self._make_provider()
+        if bridge is not None:
+            gp_type = (self.graph_provider or {}).get("type") or "repomap_l3"
+            print(f"[0/5] Cross-Module Enrichment ({gp_type})...")
             externals = bridge.get_module_external_consumers(
                 self.module_name, self.source_root
             )
@@ -297,6 +308,41 @@ class OraclePipeline:
             stats.update(self._stage0_diagnostics)
         return stats
 
+    def _make_provider(self):
+        """Construct the graph provider for Stage 0, or None when none
+        is configured. Explicit graph_provider config wins over the
+        legacy repomap_l3 shortcut.
+        """
+        gp = self.graph_provider or {}
+        gp_type = gp.get("type")
+        if gp_type == "grep_fallback":
+            from providers.grep_provider import GrepProvider
+            repo_root = (
+                self.repo_root_for_grep
+                or gp.get("repo_root")
+                or os.getcwd()
+            )
+            return GrepProvider(
+                repo_root=repo_root,
+                include_dirs=gp.get("include_dirs"),
+            )
+        if gp_type == "repomap_l3":
+            from repomap_bridge import RepoMapBridge
+            path = gp.get("path") or self.repomap_l3
+            if not path:
+                return None
+            return RepoMapBridge(path)
+        if gp_type and gp_type not in ("repomap_l3", "grep_fallback"):
+            raise ValueError(
+                f"Unknown graph_provider.type: {gp_type!r}. "
+                f"Supported: repomap_l3, grep_fallback."
+            )
+        # No explicit provider; fall back to repomap_l3 path argument if set.
+        if self.repomap_l3:
+            from repomap_bridge import RepoMapBridge
+            return RepoMapBridge(self.repomap_l3)
+        return None
+
     def _resolve_profile(self, stats: dict) -> str:
         """Return the profile name to apply.
 
@@ -373,6 +419,12 @@ def main():
         help="Quality gate profile (auto|default|leaf|hub|<custom>). "
              "'auto' uses Stage 0 diagnostics to pick 'leaf' for isolated modules.",
     )
+    parser.add_argument(
+        "--emit-legacy-kg-keys", action="store_true",
+        help="Also emit the pre-v4.2 aggregated [involved_files] / "
+             "[affected_external_files] observation lines for KG queries "
+             "that still target the old format.",
+    )
 
     args = parser.parse_args()
 
@@ -395,15 +447,25 @@ def main():
         sys.exit(1)
 
     cfg = normalize_config(load_json_config(args.config)) if args.config else normalize_config({})
-    graph_provider = cfg.get("graph_provider") or {}
+    graph_provider = dict(cfg.get("graph_provider") or {})
     repomap_l3 = args.repomap_l3
-    if not repomap_l3 and graph_provider.get("type") == "repomap_l3":
+    if graph_provider.get("type") == "repomap_l3":
         # Resolve relative to the config file's directory so callers can
         # invoke the pipeline from any cwd (e.g. running the oracle scripts
         # against a separate project's oracle.config.json).
         resolved = resolve_config_path(cfg, ["graph_provider", "path"])
         if resolved is not None:
-            repomap_l3 = str(resolved)
+            graph_provider["path"] = str(resolved)
+            if not repomap_l3:
+                repomap_l3 = str(resolved)
+
+    # For grep_fallback, default repo_root_for_grep to the config's
+    # directory unless the config explicitly provides one. Keeps the
+    # invocation pattern symmetric with repomap_l3 -- both providers
+    # interpret paths relative to where the config lives.
+    repo_root_for_grep = graph_provider.get("repo_root")
+    if graph_provider.get("type") == "grep_fallback" and not repo_root_for_grep:
+        repo_root_for_grep = cfg.get("_config_dir") or os.getcwd()
 
     # Run pipeline
     pipeline = OraclePipeline(
@@ -416,6 +478,9 @@ def main():
         quality_gate=cfg.get("quality_gate"),
         quality_gate_profiles=cfg.get("quality_gate_profiles"),
         profile=args.profile,
+        emit_legacy_kg_keys=args.emit_legacy_kg_keys,
+        graph_provider=graph_provider,
+        repo_root_for_grep=repo_root_for_grep,
         allow_warn=args.allow_warn,
     )
     try:

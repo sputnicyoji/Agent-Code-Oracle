@@ -1,6 +1,6 @@
 [project]
 name = "agent-code-oracle"
-version = "4.1.0"
+version = "4.2.0"
 description = "Extract implicit code contracts that AI coding agents can't discover on their own"
 readme = "README.md"
 license = {text = "MIT"}
