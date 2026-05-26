@@ -21,11 +21,58 @@ RE_CHILD = re.compile(r'^\s+<-\s+(\S+)\s+\((\w+)\)')
 RE_PARENT = re.compile(r'^\s+->\s+(\S+)\s+\((\w+)\)')
 
 
+# Type-level declarations across the languages oracle commonly scans. The
+# pattern intentionally over-includes ("class" inside a comment block still
+# matches) -- that direction is safe because it only widens the internal set,
+# never reports a false external. Function-level symbols (Go `func`, Rust
+# `fn`, C/C++ free functions) are out of scope for v1 -- contracts work at
+# the type boundary.
+_DEFN_RE = re.compile(
+    r"^\s*(?:public|private|protected|internal|export|pub|static)?\s*"
+    r"(?:abstract|sealed|final|partial|async)?\s*"
+    r"(?:class|struct|interface|record|trait|impl|enum|type)\s+"
+    r"([A-Z][A-Za-z0-9_]*)",
+    re.MULTILINE,
+)
+
+# File extensions we will open to look for type definitions. Anything else is
+# ignored -- saves time on binary/asset trees and keeps the regex from being
+# applied to formats it does not understand. Extend as new languages land.
+_SOURCE_SUFFIXES = {
+    ".cs", ".java", ".kt", ".scala",
+    ".ts", ".tsx", ".js", ".jsx",
+    ".py", ".rs", ".go", ".swift",
+    ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".h",
+    ".php", ".rb",
+}
+
+
+def _extract_top_level_symbols(path: Path) -> set[str]:
+    """Return the set of type-level symbol names defined in `path`.
+
+    Regex over tree-sitter: we accept the over-inclusion (matches inside
+    comments or strings) because the only consequence is a slightly wider
+    "internal" set, which never produces a false external positive. The
+    docstring of `index_source_tree` carries the user-facing version of this
+    contract.
+    """
+    if path.suffix.lower() not in _SOURCE_SUFFIXES:
+        return set()
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return set()
+    return set(_DEFN_RE.findall(text))
+
+
 class RepoMapBridge:
     """Parse and query RepoMap L3 reference graph"""
 
     def __init__(self, l3_path: str):
         self.nodes: dict[str, dict] = {}
+        # Repo-relative path (posix-form) -> set of type-level symbol names
+        # defined in that file. Populated lazily by `index_source_tree`.
+        self._file_to_symbols: dict[str, set[str]] = {}
         self._parse(l3_path)
 
     def _parse(self, path: str):
@@ -89,6 +136,70 @@ class RepoMapBridge:
         ]
         return sorted(result, key=lambda x: x[1], reverse=True)
 
+    def index_source_tree(self, source_root: str) -> set[str]:
+        """Walk `source_root`, parse type-level definitions, populate
+        `self._file_to_symbols`, and return the full set of symbols defined
+        in the tree.
+
+        The returned set is "every type-level symbol the module declares".
+        That is exactly what `get_module_external_consumers` needs to decide
+        which child references go outside the module. We deliberately do
+        NOT intersect with `self.nodes`: L3 only carries high-impact nodes,
+        so a module-internal class that nobody outside the module imports
+        will not appear there. Filtering by node membership would push such
+        classes back into the "external" bucket when they are referenced
+        as children of internal L3 nodes -- the exact failure mode #1 from
+        Phase A was trying to fix.
+
+        The previous implementation intersected file *stems* with L3 nodes,
+        so a single source file with N type definitions only contributed at
+        most one entry (the one whose name matched the file's stem). With
+        full per-file parsing, multi-class hierarchies (Buff.cs style) are
+        accurately classified.
+        """
+        self._file_to_symbols.clear()
+        internal: set[str] = set()
+        if not source_root or not os.path.isdir(source_root):
+            return internal
+
+        root = Path(source_root)
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            symbols = _extract_top_level_symbols(path)
+            if not symbols:
+                continue
+            # Key by posix path relative to source_root for stable lookups
+            # regardless of the caller's slash style.
+            try:
+                rel = path.relative_to(root).as_posix()
+            except ValueError:
+                rel = path.as_posix()
+            self._file_to_symbols[rel] = symbols
+            self._file_to_symbols[path.name] = (
+                self._file_to_symbols.get(path.name, set()) | symbols
+            )
+            internal.update(symbols)
+        return internal
+
+    def file_to_symbols(self, file_ref: str) -> set[str]:
+        """Look up the type-level symbols defined in `file_ref`.
+
+        Callers may pass a repo-relative path, a path relative to the indexed
+        source root, or a basename. The bridge first tries the exact key,
+        then the basename, so multi-class file lookups work for any of those
+        forms. Empty set means "no type definitions known for this file" --
+        could be because the file is not source, was not indexed, or simply
+        contains no top-level types.
+        """
+        norm = file_ref.replace("\\", "/")
+        if norm in self._file_to_symbols:
+            return self._file_to_symbols[norm]
+        # Match by basename when callers pass a path that wasn't indexed under
+        # the same root we walked.
+        base = Path(norm).name
+        return self._file_to_symbols.get(base, set())
+
     def get_module_external_consumers(
         self, module_name: str, source_root: str
     ) -> list[dict]:
@@ -101,22 +212,7 @@ class RepoMapBridge:
         Returns:
             List of {class_name, consumer_name, relation_type, is_external}
         """
-        # Build the set of module-internal symbol names by intersecting file
-        # stems with L3 graph nodes. The previous version added every file
-        # stem with any non-empty suffix (README.md -> "README", config.json
-        # -> "config", etc.), which then shadowed unrelated external symbols
-        # that happened to share a name and silently dropped their consumers
-        # from the external set.
-        internal_classes: set[str] = set()
-        if source_root and os.path.isdir(source_root):
-            for dirpath, _, filenames in os.walk(source_root):
-                for f in filenames:
-                    stem = Path(f).stem
-                    # Only treat a file stem as an internal symbol if the L3
-                    # graph actually has a node for it. Non-code files no
-                    # longer pollute the internal set.
-                    if stem in self.nodes:
-                        internal_classes.add(stem)
+        internal_classes = self.index_source_tree(source_root)
 
         results = []
         for cls_name, node in self.nodes.items():

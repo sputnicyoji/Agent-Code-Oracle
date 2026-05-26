@@ -173,5 +173,79 @@ class TestHighImpactClasses(unittest.TestCase):
         self.assertEqual(result[0][0], "BaseController")
 
 
+class TestInternalClassesMultiDefn(unittest.TestCase):
+    """Phase A #1: `index_source_tree` must enumerate ALL type definitions
+    inside each source file, not just the one whose name equals the file
+    stem. Regression for the bug where Buff.cs-style multi-class files
+    leaked their siblings into the external-consumer bucket.
+    """
+
+    MULTI_DIR = FIXTURES_DIR / "multi_class_module"
+
+    def setUp(self):
+        self.bridge = RepoMapBridge(str(SAMPLE_L3))
+        self.internal = self.bridge.index_source_tree(str(self.MULTI_DIR))
+
+    def test_internal_set_includes_non_filename_classes(self):
+        # Controllers.cs declares PaymentController, UserController, OrderController.
+        # All three are L3 nodes (inherits from BaseController in the fixture).
+        for name in ("PaymentController", "UserController", "OrderController"):
+            self.assertIn(name, self.internal,
+                          f"{name} should be in internal set (defined in Controllers.cs)")
+
+    def test_internal_set_includes_base_types(self):
+        # BaseController is the file's "stem"; old behaviour found it.
+        # Verify the refactor still finds it.
+        self.assertIn("BaseController", self.internal)
+
+    def test_file_to_symbols_returns_all_definitions(self):
+        # Look up by basename works because index_source_tree indexes both
+        # paths and basenames.
+        controllers = self.bridge.file_to_symbols("Controllers.cs")
+        self.assertEqual(
+            controllers,
+            {"BaseController", "PaymentController", "UserController", "OrderController"},
+        )
+
+    def test_file_to_symbols_picks_up_sub_dir(self):
+        # The walker must descend into nested directories.
+        events = self.bridge.file_to_symbols("EventBus.cs")
+        self.assertEqual(events, {"EventBus", "OrderService"})
+
+    def test_non_source_files_ignored(self):
+        # README.txt contains the word "class" but must NOT contribute.
+        # _SOURCE_SUFFIXES gates this.
+        readme_syms = self.bridge.file_to_symbols("README.txt")
+        self.assertEqual(readme_syms, set())
+        self.assertNotIn("ShouldNotBeFound", self.internal)
+
+    def test_unknown_file_returns_empty_set(self):
+        # Non-indexed file -- bridge returns empty set, never raises.
+        self.assertEqual(self.bridge.file_to_symbols("nope.cs"), set())
+
+    def test_get_module_external_consumers_uses_full_internal_set(self):
+        """End-to-end: BaseController's three subclasses live in the same
+        Controllers.cs file. Old code marked them external (file stem
+        mismatch). New code recognises them as internal, so the L3 edges
+        between BaseController and its subclasses do NOT show up as
+        external consumers."""
+        results = self.bridge.get_module_external_consumers(
+            "Acme.Web", str(self.MULTI_DIR)
+        )
+        externals = [r for r in results if r["is_external"]]
+        # All three subclasses are internal -> 0 external edges from
+        # BaseController. The other L3 root classes (IRepository, EventBus,
+        # BaseService) might still produce edges if their children are NOT
+        # defined in this fixture. UserRepository / OrderRepository ARE
+        # defined here; PaymentGateway / InvoiceGenerator / AuthMiddleware
+        # / NotificationService are NOT.
+        external_consumer_names = {r["consumer_name"] for r in externals}
+        for inside_name in ("PaymentController", "UserController",
+                            "OrderController", "UserRepository",
+                            "OrderRepository", "OrderService"):
+            self.assertNotIn(inside_name, external_consumer_names,
+                             f"{inside_name} is in fixture; should not be external")
+
+
 if __name__ == "__main__":
     unittest.main()

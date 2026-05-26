@@ -8,3 +8,4 @@ oracle-sync-report.json
 dist/
 build/
 .pytest_cache/
+_planning/

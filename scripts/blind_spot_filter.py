@@ -13,6 +13,9 @@ v2.1 fix:
 """
 
 import re
+from pathlib import PurePosixPath
+
+from oracle_config import extract_contract_paths
 
 
 # R1: Thread-safety keywords (trigger when >= THREAD_SAFETY_MIN_HITS match)
@@ -115,21 +118,37 @@ class BlindSpotFilter:
         return hits >= self.thread_safety_min_hits
 
     def _check_r2_single_dir(self, contract: dict) -> bool:
-        """R2: involved_files all in same directory (rationale only)"""
+        """R2: involved_files all in same directory (rationale only).
+
+        Schema v2 provides full repo-relative paths under `involved[].path`,
+        which is what this check needs to be honest. Rationale contracts that
+        span a single directory are suspicious -- "why is the design like
+        this" should usually cut across a boundary. Single-dir rationale is
+        often style guidance dressed up as design intent.
+
+        Only fires when every path is repo-relative (contains a separator).
+        Bare basenames (legacy v1 contracts where the bridge could not
+        resolve a full path) are skipped: we cannot tell what directory they
+        come from, so a R2 tag would be a guess.
+        """
         if contract.get("type") != "rationale":
             return False
 
-        files = contract.get("involved_files", [])
-        if len(files) <= 1:
+        paths = extract_contract_paths(contract, "involved_files")
+        if len(paths) <= 1:
             return False
 
-        # Check if filenames suggest same directory (heuristic when no path info available)
-        # Since involved_files only stores filenames without paths, use filename-prefix heuristic
-        # e.g.: ActorSyncSystem.cs, ActorInitSystem.cs -> possibly same directory
-        # but: ActorSyncSystem.cs, SomeOtherActor.cs -> different directories
-        # Simplified rule: if all filenames share same prefix (stripping System/Job/Data suffix) -> possibly same dir
-        # This heuristic is weak; only used as WARN not DROP
-        return False  # Disabled until path info is available
+        # Only repo-relative paths participate. A basename like "Foo.cs" with
+        # no separator contributes no directory information.
+        dirs: set[str] = set()
+        for p in paths:
+            norm = p.replace("\\", "/")
+            if "/" not in norm:
+                # Lone basename -- cannot infer directory; conservatively
+                # treat the contract as "not eligible for R2".
+                return False
+            dirs.add(PurePosixPath(norm).parent.as_posix())
+        return len(dirs) == 1
 
     def _check_r3_thread_safety_type(self, contract: dict) -> bool:
         """R3: thread_safety type global demotion"""

@@ -196,5 +196,66 @@ class TestCleanRationalePreserved(unittest.TestCase):
         self.assertEqual(len(result), 3)
 
 
+class TestR2SingleDir(unittest.TestCase):
+    """Phase A #4: R2 was a stub returning False unconditionally. Now that
+    schema v2 carries full repo-relative paths, R2 fires when a rationale
+    contract's involved paths all live in a single directory -- such
+    rationale is suspicious because real design intent usually crosses a
+    boundary.
+    """
+
+    def _rationale(self, paths: list[str]) -> dict:
+        return {
+            "type": "rationale",
+            "title": "Some rationale",
+            "description": "Why we did the thing",
+            "blind_spot": "agents miss it",
+            "violation_consequence": "test",
+            "involved": [{"path": p} for p in paths],
+            "confidence": 0.7,
+        }
+
+    def _run(self, contract: dict) -> dict:
+        result = BlindSpotFilter().process([contract])
+        self.assertEqual(len(result), 1)
+        return result[0]
+
+    def test_single_dir_paths_trigger_r2(self):
+        c = self._rationale(["src/payment/result.ts", "src/payment/refund.ts"])
+        out = self._run(c)
+        self.assertIn("_filter_tag", out, "R2 should fire on single-dir paths")
+        self.assertIn("R2", out["_filter_tag"])
+
+    def test_multi_dir_paths_do_not_trigger(self):
+        c = self._rationale(["src/payment/result.ts", "src/invoice/generator.ts"])
+        out = self._run(c)
+        # Two distinct directories; R2 stays silent.
+        self.assertNotIn("R2", out.get("_filter_tag", ""))
+
+    def test_bare_basenames_do_not_trigger(self):
+        # Legacy v1 path-less data: R2 cannot infer a directory, must skip.
+        c = self._rationale(["foo.cs", "bar.cs"])
+        out = self._run(c)
+        self.assertNotIn("R2", out.get("_filter_tag", ""))
+
+    def test_single_path_does_not_trigger(self):
+        c = self._rationale(["src/payment/result.ts"])
+        out = self._run(c)
+        self.assertNotIn("R2", out.get("_filter_tag", ""))
+
+    def test_r2_only_fires_for_rationale(self):
+        c = {
+            "type": "data_flow",
+            "title": "x",
+            "description": "x",
+            "blind_spot": "x",
+            "violation_consequence": "x",
+            "involved": [{"path": "a/x.ts"}, {"path": "a/y.ts"}],
+            "confidence": 0.7,
+        }
+        out = self._run(c)
+        self.assertNotIn("R2", out.get("_filter_tag", ""))
+
+
 if __name__ == "__main__":
     unittest.main()

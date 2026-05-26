@@ -8,6 +8,7 @@ CLI:
 
 import json
 import subprocess
+import sys
 import argparse
 from pathlib import Path
 
@@ -46,33 +47,62 @@ class IncrementalScanner:
             return data["contracts"]
         return data if isinstance(data, list) else []
 
-    def get_changed_files(self, commits: int = 1) -> list[str]:
-        """Get changed files from git diff using configured include/exclude globs."""
+    def get_changed_files(self, commits: int = 1) -> list[str] | None:
+        """Get changed files from git diff using configured include/exclude globs.
+
+        Returns:
+            list[str] -- changed paths (possibly empty -> truly no changes)
+            None      -- git failed (different from "no changes"); callers
+                         should not treat this as "nothing to do".
+
+        Mirrors the fixed shape in `oracle_sync.get_changed_files`: try
+        ORIG_HEAD first (handles the common "post-merge with merged refs"
+        case), fall back to HEAD~N (works on shallow/initial clones), 30s
+        timeout to keep a hung git from freezing the scanner, and
+        distinguish a real error from an empty diff.
+        """
+        if commits < 1:
+            print(f"Warning: invalid commits={commits}, using 1")
+            commits = 1
         try:
-            # Find repo root dynamically
             root_result = subprocess.run(
                 ["git", "rev-parse", "--show-toplevel"],
-                capture_output=True, text=True
+                capture_output=True, text=True, timeout=30,
             )
             if root_result.returncode != 0:
                 print(f"Warning: not a git repo: {root_result.stderr.strip()}")
-                return []
+                return None
             repo_root = root_result.stdout.strip()
+            # ORIG_HEAD is set after a merge/pull/rebase to the pre-op tip,
+            # which is exactly what an incremental scanner cares about after
+            # a merge. HEAD~N is a fallback for shallow or first-merge cases
+            # where ORIG_HEAD does not exist.
             result = subprocess.run(
-                ["git", "diff", "--name-only", f"HEAD~{commits}"],
-                capture_output=True, text=True, cwd=repo_root
+                ["git", "diff", "--name-only", "ORIG_HEAD", "HEAD"],
+                capture_output=True, text=True, cwd=repo_root, timeout=30,
             )
             if result.returncode != 0:
-                print(f"Warning: git diff failed: {result.stderr.strip()}")
-                return []
+                result = subprocess.run(
+                    ["git", "diff", "--name-only", f"HEAD~{commits}"],
+                    capture_output=True, text=True, cwd=repo_root, timeout=30,
+                )
+                if result.returncode != 0:
+                    print(
+                        f"Warning: git diff failed (rc={result.returncode}): "
+                        f"{result.stderr.strip()[:200]}"
+                    )
+                    return None
             return [
                 f.replace("\\", "/")
                 for f in result.stdout.splitlines()
                 if is_included(f, self.include, self.exclude)
             ]
+        except subprocess.TimeoutExpired:
+            print("Warning: git diff timed out")
+            return None
         except FileNotFoundError:
             print("Warning: git not found in PATH")
-            return []
+            return None
 
     def analyze(self, changed_files: list[str]) -> dict:
         """Analyze contract impact of changed files"""
@@ -169,7 +199,16 @@ def main():
     args = parser.parse_args()
     cfg = normalize_config(load_json_config(args.config)) if args.config else normalize_config({})
     scanner = IncrementalScanner(args.l3, args.contracts, cfg.get("include"), cfg.get("exclude"))
-    changed = args.diff_files or scanner.get_changed_files(args.commits)
+    if args.diff_files:
+        changed = args.diff_files
+    else:
+        changed = scanner.get_changed_files(args.commits)
+        # None means git itself failed -- distinct from "no matching changes".
+        # Returning early without distinguishing the two would silently hide
+        # a broken environment behind a green "nothing to do" status.
+        if changed is None:
+            print("Error: could not determine changed files (see warnings above)", file=sys.stderr)
+            sys.exit(1)
 
     if not changed:
         print("No .cs files changed.")

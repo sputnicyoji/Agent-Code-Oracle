@@ -111,8 +111,16 @@ class OraclePipeline:
                 involved = extract_contract_paths(contract, "involved_files")
                 l3_consumers = []
                 for f in involved:
-                    symbol = Path(f).stem
-                    l3_consumers.extend(consumer_index.get(symbol, []))
+                    # Previously `Path(f).stem` -- only matched contracts whose
+                    # involved file name happened to equal the symbol name
+                    # defined inside it. Now we ask the bridge for every
+                    # type-level symbol the file declares and look each up,
+                    # which makes multi-class files (Buff.cs, IEntityCommand.cs,
+                    # ...) findable. `bridge.get_module_external_consumers`
+                    # above already populated `_file_to_symbols` for the
+                    # module source tree.
+                    for symbol in bridge.file_to_symbols(f):
+                        l3_consumers.extend(consumer_index.get(symbol, []))
                 if l3_consumers:
                     # Read existing externals through the bridge so v2 contracts
                     # that only have `affected_external` (not the v1
