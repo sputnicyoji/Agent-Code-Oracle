@@ -27,6 +27,7 @@ from oracle_config import (
     extract_contract_paths,
     load_json_config,
     normalize_config,
+    resolve_config_path,
     set_contract_paths,
 )
 
@@ -54,12 +55,18 @@ class OraclePipeline:
                  dedup_threshold: float = 0.8, repomap_l3: str = None,
                  repo_root: str = None, include: list[str] = None,
                  exclude: list[str] = None, quality_gate: dict = None,
+                 quality_gate_profiles: dict = None,
+                 profile: str = "auto",
                  allow_warn: bool = False):
         self.module_name = module_name
         self.source_root = source_root
         self.repomap_l3 = repomap_l3
+        # Base gate; per-profile overrides apply lazily in process() once we
+        # know the auto-selected profile.
         self.quality_gate = dict(DEFAULT_QUALITY_GATE)
         self.quality_gate.update(quality_gate or {})
+        self.quality_gate_profiles = dict(quality_gate_profiles or {})
+        self.profile = profile  # "auto" | "default" | "leaf" | "hub" | custom
         self.allow_warn = allow_warn
         self.validator = ContractValidator(
             source_root,
@@ -70,6 +77,10 @@ class OraclePipeline:
         self.dedup = SemanticDedup(threshold=dedup_threshold)
         self.blind_spot_filter = BlindSpotFilter()
         self.injector = KGInjector()
+        # Populated by Stage 0 when it runs; consumed by _compute_stats and
+        # the quality-gate profile auto-selector. Empty dict means Stage 0
+        # was skipped (no repomap_l3 configured).
+        self._stage0_diagnostics: dict = {}
 
     def process(self, contracts: list[dict]) -> dict:
         """
@@ -138,7 +149,48 @@ class OraclePipeline:
                         "target": ", ".join(sorted(set(l3_consumers))),
                     })
             enriched = sum(1 for c in contracts if c.get("_l3_enriched"))
-            print(f"  [OK] {enriched}/{len(contracts)} contracts enriched with L3 data\n")
+
+            # Diagnostic counters. Used both by the [NOTE] message printed
+            # when enriched == 0 (so the user knows WHY enrichment found
+            # nothing) and by quality-gate auto-profile (cross_edges == 0
+            # AND internal_class_count > 0 -> isolated module -> leaf).
+            internal_class_count = len(bridge._file_to_symbols)
+            # Note: index_source_tree stores both repo-relative paths AND
+            # basenames as keys, so the raw len() double-counts. Use the
+            # set of distinct symbol-set values instead.
+            internal_symbols = set()
+            for syms in bridge._file_to_symbols.values():
+                internal_symbols.update(syms)
+            internal_class_count = len(internal_symbols)
+            cross_edges = sum(1 for e in externals if e["is_external"])
+            contract_paths_total = sum(
+                len(extract_contract_paths(c, "involved_files")) for c in contracts
+            )
+            self._stage0_diagnostics = {
+                "internal_class_count": internal_class_count,
+                "cross_edges": cross_edges,
+                "contract_paths_total": contract_paths_total,
+                "enriched": enriched,
+            }
+
+            if enriched == 0:
+                print(f"  [NOTE] 0/{len(contracts)} contracts enriched. Diagnostic:")
+                print(f"    internal symbols recognised: {internal_class_count}")
+                print(f"    cross-module edges in graph: {cross_edges}")
+                print(f"    contract involved-paths total: {contract_paths_total}")
+                if cross_edges == 0 and internal_class_count > 0:
+                    print(f"    -> module appears isolated; consider --profile leaf")
+                elif internal_class_count == 0:
+                    print(f"    -> graph provider sees no symbols under "
+                          f"{self.source_root}")
+                    print(f"       (check source_root, include/exclude, or rebuild "
+                          f"the L3 index)")
+                else:
+                    print(f"    -> contracts reference files outside the graph's "
+                          f"symbol set")
+            else:
+                print(f"  [OK] {enriched}/{len(contracts)} contracts enriched with L3 data")
+            print()
 
         # Stage 1: Validation
         print("[1/5] Contract Validation...")
@@ -158,6 +210,29 @@ class OraclePipeline:
         # Stage 4: Stats + Quality Gate
         print("[4/5] Stats + Quality Gate...")
         stats = self._compute_stats(filtered)
+
+        # Resolve profile now that Stage 0 diagnostics are in stats. Auto
+        # selection chooses 'leaf' when the module is isolated (Stage 0 saw
+        # source symbols but zero cross-module edges). Explicit --profile
+        # overrides auto. Unknown profile name falls back silently to base
+        # gate rather than crashing.
+        selected_profile = self._resolve_profile(stats)
+        if selected_profile and selected_profile in self.quality_gate_profiles:
+            overrides = self.quality_gate_profiles[selected_profile]
+            self.quality_gate.update(overrides)
+            stats["quality_gate_profile"] = selected_profile
+            if self.profile == "auto" and selected_profile != "default":
+                print(f"  [NOTE] Quality gate auto-promoted to '{selected_profile}' "
+                      f"profile (cross-module edges = "
+                      f"{stats.get('cross_edges', 'n/a')}).")
+                # Adjustments after the print line so the user sees the
+                # threshold that will actually be applied below.
+                if "min_high_value_ratio" in overrides:
+                    print(f"         min_high_value_ratio = "
+                          f"{overrides['min_high_value_ratio']}")
+        elif selected_profile:
+            stats["quality_gate_profile"] = selected_profile
+
         failures = self._quality_gate_failures(stats, filtered)
         stats["quality_gate_pass"] = not failures
         stats["quality_gate_failures"] = failures
@@ -203,7 +278,7 @@ class OraclePipeline:
         demoted = [c for c in contracts if c.get("_filter_tag")]
         demoted_titles = [f"  - [{c.get('_filter_tag')}] {c['title'][:60]}" for c in demoted]
 
-        return {
+        stats = {
             "total": total,
             "effective": effective,
             "by_type": by_type,
@@ -215,6 +290,30 @@ class OraclePipeline:
             "p0_p1_check": "PASS" if p0_p1_ratio >= 0.5 else "WARN: blast_radius + rationale < 50%",
             "demoted_contracts": demoted_titles,
         }
+        # Stage 0 diagnostic counters travel into stats so the JSON output
+        # carries them and downstream consumers (auto-profile selector,
+        # dashboards) can read why enrichment had the shape it did.
+        if self._stage0_diagnostics:
+            stats.update(self._stage0_diagnostics)
+        return stats
+
+    def _resolve_profile(self, stats: dict) -> str:
+        """Return the profile name to apply.
+
+        - Explicit non-auto profile -> use it as-is.
+        - 'auto' -> 'leaf' when Stage 0 confirmed the module is isolated
+          (saw internal symbols but zero cross-module edges), otherwise
+          'default'.
+        - When Stage 0 did not run (no repomap_l3 configured) auto cannot
+          tell isolated from default; we conservatively return 'default'.
+        """
+        if self.profile != "auto":
+            return self.profile
+        internal = stats.get("internal_class_count", 0)
+        cross = stats.get("cross_edges", -1)  # -1 = stage 0 skipped
+        if cross == 0 and internal > 0:
+            return "leaf"
+        return "default"
 
     def _quality_gate_failures(self, stats: dict, contracts: list[dict]) -> list[str]:
         gate = self.quality_gate
@@ -269,6 +368,11 @@ def main():
     parser.add_argument("--repomap-l3", help="Path to repomap-L3-relations.md for L3 enrichment")
     parser.add_argument("--config", help="Path to oracle.config.json")
     parser.add_argument("--allow-warn", action="store_true", help="Write output even when quality gate fails")
+    parser.add_argument(
+        "--profile", default="auto",
+        help="Quality gate profile (auto|default|leaf|hub|<custom>). "
+             "'auto' uses Stage 0 diagnostics to pick 'leaf' for isolated modules.",
+    )
 
     args = parser.parse_args()
 
@@ -294,7 +398,12 @@ def main():
     graph_provider = cfg.get("graph_provider") or {}
     repomap_l3 = args.repomap_l3
     if not repomap_l3 and graph_provider.get("type") == "repomap_l3":
-        repomap_l3 = graph_provider.get("path")
+        # Resolve relative to the config file's directory so callers can
+        # invoke the pipeline from any cwd (e.g. running the oracle scripts
+        # against a separate project's oracle.config.json).
+        resolved = resolve_config_path(cfg, ["graph_provider", "path"])
+        if resolved is not None:
+            repomap_l3 = str(resolved)
 
     # Run pipeline
     pipeline = OraclePipeline(
@@ -305,6 +414,8 @@ def main():
         include=cfg.get("include"),
         exclude=cfg.get("exclude"),
         quality_gate=cfg.get("quality_gate"),
+        quality_gate_profiles=cfg.get("quality_gate_profiles"),
+        profile=args.profile,
         allow_warn=args.allow_warn,
     )
     try:

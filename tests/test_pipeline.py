@@ -347,5 +347,128 @@ class TestStage0MultiSymbolFile(unittest.TestCase):
         self.assertIn("contracts", result)
 
 
+class TestStage0Diagnostics(unittest.TestCase):
+    """Phase B #5: Stage 0 surfaces diagnostic counters when enriched==0
+    so the user can tell isolated module from broken index from contract
+    mismatch.
+    """
+
+    FIXTURES = Path(__file__).parent / "fixtures"
+
+    def _pipeline(self, **kwargs):
+        defaults = dict(
+            module_name="Acme",
+            source_root=str(self.FIXTURES / "multi_class_module"),
+            repomap_l3=str(self.FIXTURES / "sample-l3.md"),
+            allow_warn=True,
+        )
+        defaults.update(kwargs)
+        return OraclePipeline(**defaults)
+
+    def test_stats_carry_stage0_counters(self):
+        # The multi_class_module fixture defines BaseController and friends.
+        # sample-l3 has BaseController -> Payment/User/OrderController; all
+        # three subclasses live in the fixture so they are NOT external.
+        # Internal symbol count > 0; cross_edges = 0 (all children internal).
+        contract = {
+            "schema_version": 2, "type": "ordering", "title": "x",
+            "description": "x", "blind_spot": "x", "violation_consequence": "x",
+            "involved": [{"path": "Controllers.cs"}], "confidence": 0.8,
+        }
+        result = self._pipeline().process([contract])
+        stats = result["stats"]
+        self.assertIn("internal_class_count", stats)
+        self.assertIn("cross_edges", stats)
+        self.assertGreater(stats["internal_class_count"], 0)
+        # All L3 children of BaseController are present in the fixture --
+        # so cross_edges == 0 even though the L3 graph reports edges.
+        self.assertEqual(stats["cross_edges"], 0)
+
+    def test_stage0_skipped_when_no_repomap(self):
+        # No repomap_l3 -> Stage 0 does not run, diagnostic counters absent.
+        # We construct via the helper but force repomap_l3 to None.
+        pipeline = OraclePipeline(
+            module_name="Acme", source_root=None, allow_warn=True,
+        )
+        contract = {
+            "schema_version": 2, "type": "ordering", "title": "x",
+            "description": "x", "blind_spot": "x", "violation_consequence": "x",
+            "involved_files": ["Controllers.cs"], "confidence": 0.8,
+        }
+        stats = pipeline.process([contract])["stats"]
+        # Stage 0 diagnostics absent
+        self.assertNotIn("cross_edges", stats)
+        self.assertNotIn("internal_class_count", stats)
+
+
+class TestQualityGateProfilesInPipeline(unittest.TestCase):
+    """Phase B #6+#7+#8: pipeline applies quality gate profiles by name,
+    auto picks 'leaf' when Stage 0 sees no cross-module edges, and reports
+    the selected profile in stats."""
+
+    FIXTURES = Path(__file__).parent / "fixtures"
+
+    def _make(self, profile, with_l3=True, profiles_override=None):
+        from oracle_config import DEFAULT_QUALITY_GATE_PROFILES
+        return OraclePipeline(
+            module_name="Acme",
+            source_root=str(self.FIXTURES / "multi_class_module") if with_l3 else None,
+            repomap_l3=str(self.FIXTURES / "sample-l3.md") if with_l3 else None,
+            quality_gate_profiles=profiles_override or {
+                name: dict(v) for name, v in DEFAULT_QUALITY_GATE_PROFILES.items()
+            },
+            profile=profile,
+            allow_warn=True,
+        )
+
+    def _trivial_contract(self):
+        return {
+            "schema_version": 2, "type": "ordering", "title": "x",
+            "description": "x", "blind_spot": "x", "violation_consequence": "x",
+            "involved": [{"path": "Controllers.cs"}], "confidence": 0.8,
+        }
+
+    def test_explicit_profile_leaf_applied(self):
+        pipeline = self._make("leaf")
+        stats = pipeline.process([self._trivial_contract()])["stats"]
+        self.assertEqual(stats["quality_gate_profile"], "leaf")
+        # leaf relaxes the ratio threshold
+        self.assertEqual(pipeline.quality_gate["min_high_value_ratio"], 0.25)
+
+    def test_explicit_profile_hub_applied(self):
+        pipeline = self._make("hub")
+        stats = pipeline.process([self._trivial_contract()])["stats"]
+        self.assertEqual(stats["quality_gate_profile"], "hub")
+        self.assertEqual(pipeline.quality_gate["min_high_value_ratio"], 0.6)
+
+    def test_auto_picks_leaf_on_isolated_module(self):
+        # Stage 0 sees source symbols but zero cross-module edges
+        # (all L3 children live inside the fixture). Auto should choose 'leaf'.
+        pipeline = self._make("auto")
+        stats = pipeline.process([self._trivial_contract()])["stats"]
+        self.assertEqual(stats["quality_gate_profile"], "leaf")
+
+    def test_auto_falls_back_to_default_without_stage0(self):
+        # No repomap -> Stage 0 cannot fire -> auto cannot detect isolation
+        # -> conservatively chooses 'default'.
+        contract = {
+            "schema_version": 2, "type": "ordering", "title": "x",
+            "description": "x", "blind_spot": "x", "violation_consequence": "x",
+            "involved_files": ["Controllers.cs"], "confidence": 0.8,
+        }
+        pipeline = self._make("auto", with_l3=False)
+        stats = pipeline.process([contract])["stats"]
+        self.assertEqual(stats["quality_gate_profile"], "default")
+
+    def test_unknown_profile_does_not_crash(self):
+        # Profile name not in profiles map -> pipeline records the name but
+        # leaves base quality_gate untouched.
+        pipeline = self._make("nonexistent")
+        stats = pipeline.process([self._trivial_contract()])["stats"]
+        self.assertEqual(stats["quality_gate_profile"], "nonexistent")
+        # Base default threshold preserved (DEFAULT_QUALITY_GATE = 0.5)
+        self.assertEqual(pipeline.quality_gate["min_high_value_ratio"], 0.5)
+
+
 if __name__ == "__main__":
     unittest.main()

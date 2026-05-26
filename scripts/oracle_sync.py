@@ -27,6 +27,7 @@ from oracle_config import (
     is_included,
     load_json_config,
     normalize_config,
+    resolve_config_path,
 )
 
 
@@ -146,7 +147,12 @@ def run_sync(l3_path: str, report_path: str, notify: bool = False, config_path: 
     if not l3_path:
         provider = cfg.get("graph_provider") or {}
         if provider.get("type") == "repomap_l3":
-            l3_path = provider.get("path")
+            # Resolve through the helper so a path in oracle.config.json is
+            # interpreted relative to the config file's directory, not the
+            # post-merge hook's cwd (which is usually the repo root and
+            # happens to work, but should not be load-bearing).
+            resolved = resolve_config_path(cfg, ["graph_provider", "path"])
+            l3_path = str(resolved) if resolved else None
 
     # 1. Get changed files. None != [] -- None means git failed, abort.
     changed = get_changed_files(

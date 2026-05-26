@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import os
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,17 @@ DEFAULT_QUALITY_GATE = {
     "max_contracts": 30,
     "min_high_value_ratio": 0.5,
     "require_evidence_for": ["blast_radius"],
+}
+
+# Profile overrides for `quality_gate`. The default profile lets the gate
+# behave as before; `leaf` relaxes high-value ratio for isolated modules
+# (no cross-module consumers visible to the graph provider); `hub` tightens
+# it for modules with many downstream consumers. Auto selection happens in
+# pipeline.py based on Stage 0 diagnostics.
+DEFAULT_QUALITY_GATE_PROFILES = {
+    "default": {"min_high_value_ratio": 0.5},
+    "leaf":    {"min_high_value_ratio": 0.25},
+    "hub":     {"min_high_value_ratio": 0.6},
 }
 
 
@@ -63,19 +75,64 @@ def find_repo_root(start: str | Path | None = None) -> Path:
 def load_json_config(config_path: str | Path | None) -> dict[str, Any]:
     """Load oracle.config.json. Wraps JSONDecodeError with file context so a
     partial/corrupt config produces a diagnostic instead of a raw stacktrace.
+
+    Side-effect: attaches `_config_dir` (the absolute directory containing
+    the config file) to the returned dict. Downstream callers use
+    `resolve_config_path` to make relative paths in the config resolve
+    against this directory instead of the caller's cwd -- otherwise running
+    `python <oracle>/scripts/pipeline.py --config <project>/oracle.config.json`
+    from a third directory breaks every relative path inside the config.
     """
     if not config_path:
         return {}
-    path = Path(config_path)
+    path = Path(config_path).resolve()
     if not path.exists():
         raise FileNotFoundError(f"Config not found: {config_path}")
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            cfg = json.load(f)
     except json.JSONDecodeError as exc:
         raise ValueError(
             f"Invalid JSON in {path}: line {exc.lineno} col {exc.colno}: {exc.msg}"
         ) from exc
+    if isinstance(cfg, dict):
+        cfg["_config_dir"] = str(path.parent)
+    return cfg
+
+
+def resolve_config_path(
+    cfg: dict[str, Any],
+    key_path: list[str],
+    default: Path | None = None,
+) -> Path | None:
+    """Resolve a string value at `cfg[key_path[0]][key_path[1]]...` to an
+    absolute Path.
+
+    - Already-absolute strings are returned as-is.
+    - Relative strings resolve against `cfg["_config_dir"]` when present,
+      otherwise against the process cwd.
+    - Missing keys, non-strings, and explicit empty strings return `default`.
+
+    This is the single helper every consumer of config-paths should use.
+    It exists because every relative path in oracle.config.json was
+    previously resolved against the caller's cwd, which broke the common
+    pattern where the oracle scripts live in one repo and the config
+    lives in another.
+    """
+    node: Any = cfg
+    for k in key_path:
+        if not isinstance(node, dict):
+            return default
+        node = node.get(k)
+        if node is None:
+            return default
+    if not isinstance(node, str) or not node:
+        return default
+    p = Path(node)
+    if p.is_absolute():
+        return p.resolve()
+    base = Path(cfg.get("_config_dir") or os.getcwd())
+    return (base / p).resolve()
 
 
 def normalize_config(raw: dict[str, Any] | None) -> dict[str, Any]:
@@ -109,6 +166,16 @@ def normalize_config(raw: dict[str, Any] | None) -> dict[str, Any]:
     quality_gate = dict(DEFAULT_QUALITY_GATE)
     quality_gate.update(raw.get("quality_gate", {}) or {})
 
+    # Profile overrides. Users can extend or replace the built-in defaults
+    # but the three canonical names (default / leaf / hub) always resolve to
+    # something so that --profile auto can fall back to them safely.
+    profiles = {k: dict(v) for k, v in DEFAULT_QUALITY_GATE_PROFILES.items()}
+    user_profiles = raw.get("quality_gate_profiles") or {}
+    for name, override in user_profiles.items():
+        if not isinstance(override, dict):
+            continue
+        profiles.setdefault(name, {}).update(override)
+
     graph_provider = raw.get("graph_provider")
     if not graph_provider and raw.get("repomap_l3"):
         graph_provider = {"type": "repomap_l3", "path": raw["repomap_l3"]}
@@ -119,6 +186,7 @@ def normalize_config(raw: dict[str, Any] | None) -> dict[str, Any]:
         "include": list(raw.get("include", DEFAULT_INCLUDE) or DEFAULT_INCLUDE),
         "exclude": list(raw.get("exclude", DEFAULT_EXCLUDE) or DEFAULT_EXCLUDE),
         "quality_gate": quality_gate,
+        "quality_gate_profiles": profiles,
         "scanned_modules": normalized_modules,
         "contract_paths": list(dict.fromkeys(contract_paths)),
         "graph_provider": graph_provider,
