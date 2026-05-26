@@ -98,6 +98,28 @@ Example config for `grep_fallback`:
 Paths in `oracle.config.json` resolve against the config file's directory, not the
 caller's cwd, so the same config works from any working directory.
 
+### Round Driver (experimental, opt-in)
+
+`scripts/round_driver.py` orchestrates the 4-round extraction flow programmatically.
+Today it ships with the deterministic Round 0 implemented and a `DryRunProvider`
+that prints prompts without calling any LLM, so you can inspect the full flow
+before paying for inference. Real LLM providers (Anthropic, OpenAI, Ollama, the
+ClaudeCode JSON-RPC bridge) are scaffolded but deferred to a future mission.
+
+```bash
+python scripts/round_driver.py \
+  --config oracle.config.json \
+  --module RoguelikeTower \
+  --module-source client/Assets/X1/ScriptGame/RoguelikeTower \
+  --module-docs docs/x15-module-document/RoguelikeTower_ForAI \
+  --provider dry_run \
+  --output-dir /tmp/rt-rounds
+```
+
+The manual flow described in the `code-oracle` skill (`SKILL.md`) continues to
+work unchanged -- the driver is an opt-in shortcut, not a replacement. Design
+rationale: [plans/phase-d-driver.md](plans/phase-d-driver.md).
+
 ### Persistence via Knowledge Graph
 
 Extracted contracts are stored as entities in a knowledge graph (compatible with

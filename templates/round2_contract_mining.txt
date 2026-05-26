@@ -1,0 +1,58 @@
+---
+round: 2
+expects_json: true
+max_output_tokens: 12000
+description: "Contract Mining -- extract implicit contracts as schema-v2 JSON"
+---
+
+You are mining implicit code contracts for module `{module_name}`.
+
+Inputs:
+
+- Architecture summary from Round 1:
+{architecture_summary}
+
+- Candidate seed files (Round 1's recommendation for what to scrutinise):
+{candidate_seeds}
+
+- Source content of the seed files:
+{seed_source_excerpts}
+
+---
+
+Extract implicit contracts as a JSON array. Schema v2:
+
+```json
+{{
+  "schema_version": 2,
+  "type": "blast_radius|rationale|data_flow|ordering|thread_safety",
+  "title": "<English one-line title>",
+  "description": "<plain-language description in the project's primary language>",
+  "blind_spot": "<why an AI agent would miss this when reading the involved files>",
+  "violation_consequence": "<what breaks if violated>",
+  "scope": {{"module": "{module_name}", "language": "<inferred-language>"}},
+  "involved": [{{"path": "repo/relative/path.ext", "symbols": ["OptionalSymbol"]}}],
+  "affected_external": [{{"path": "repo/relative/consumer.ext", "symbols": ["OptionalSymbol"]}}],
+  "evidence": [{{"kind": "static_reference|code_comment|data_flow_trace|design_rationale",
+                 "source": "<source-locator>",
+                 "target": "<path-or-symbol>"}}],
+  "confidence": 0.0-1.0
+}}
+```
+
+Constraints:
+
+- `blast_radius + rationale` should reach the configured high-value ratio
+  (default 50%). Prefer those types when the contract is about cross-file
+  impact or design intent.
+- Aim for 15-30 contracts on a large module, fewer on a leaf module.
+- Use repo-relative paths, not basenames.
+- `blast_radius` contracts require at least one source-backed evidence
+  entry (kind in static_reference / code_comment / data_flow_trace).
+- Do NOT emit language-specific fields outside `scope.language`.
+- Confidence reflects how much external-to-the-file context is needed to
+  understand the constraint. 0.9+ = "you absolutely cannot derive this
+  from the involved files alone". 0.5 or lower = "an attentive reader
+  could possibly figure this out".
+
+Output the JSON array only -- no prose, no markdown fences.

@@ -1,0 +1,47 @@
+---
+round: 1
+expects_json: false
+max_output_tokens: 6000
+description: "Architect's Eye -- summarise data flow, assumptions, and consumers"
+---
+
+You are analysing the module `{module_name}` as its original architect.
+You know the design intent, implicit assumptions, and the downstream
+breakage risk of changes here.
+
+Below are the source-tree index and the static-provider evidence pack
+collected in Round 0. Treat the static evidence as ground truth for what
+the reference graph knows; treat the source files as ground truth for
+what is declared.
+
+## Source Index
+
+{source_index}
+
+## Round 0 Evidence (Static Provider)
+
+{round0_evidence}
+
+## Module Documentation Excerpts
+
+{module_docs}
+
+---
+
+Answer:
+
+1. How does data enter, transform, and leave this module?
+2. Which assumptions are NOT local to one file -- in other words, what
+   does this module believe about its callers / callees / runtime that a
+   reader of any single file would miss?
+3. Which data shapes or states have validity windows (frame-bound,
+   request-bound, transaction-bound, etc.)?
+4. Who consumes this module's output? Refer to the static evidence and
+   call out anything the evidence does NOT cover.
+5. Which consequences cannot be inferred from direct imports/calls alone
+   -- comments, semantic conventions, or design choices recorded only in
+   the docs?
+
+End your answer with a `## candidate_seeds` block: a YAML list of
+{{file, reason}} entries for the files Round 2 should read most carefully.
+Aim for 5-15 seeds for a typical module. Use repo-relative paths.

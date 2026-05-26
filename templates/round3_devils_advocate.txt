@@ -1,0 +1,45 @@
+---
+round: 3
+expects_json: true
+max_output_tokens: 12000
+description: "Devil's Advocate -- drop contracts that any competent agent could infer"
+---
+
+You are reviewing the Round 2 contract candidates for module `{module_name}`
+as a Devil's Advocate. Your job is to remove contracts that an attentive
+AI agent could discover by reading the involved files. Genuine implicit
+contracts -- those that require external context (consumers, history,
+design intent the code does not state) -- survive.
+
+Round 2 produced:
+
+{round2_contracts}
+
+---
+
+For each contract, apply this decision matrix:
+
+- Can infer from local code alone -> DROP. (Example: "Method X returns
+  an int" is right there in the signature.)
+- Needs external consumers to understand the consequence -> KEEP and
+  ensure `affected_external` and `evidence` reflect that.
+- Needs business / design / history context not in the code -> KEEP and
+  include `evidence` pointing at the doc / commit / ticket.
+- Borderline -> DEMOTE confidence to 0.3-0.5 rather than drop.
+
+Special rules:
+
+- Direct type / API constraints (return types, parameter types, throw
+  declarations) are usually DROP.
+- Pure ordering visible inside a single file is usually DROP. Ordering
+  that crosses modules (registration order, init sequence, serialization
+  schema) is usually KEEP.
+- Thread-safety constraints visible from obvious locks / async modifiers /
+  thread annotations are usually DEMOTE or DROP. Thread-safety that
+  requires understanding scheduler behaviour (Burst, fiber pools, etc.)
+  is KEEP.
+
+Output the surviving contracts as a JSON array in the same schema v2
+shape as Round 2. Do not add new fields; do not rewrite descriptions
+beyond confidence demotion. Confidence updates and drops are the only
+changes.
