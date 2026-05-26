@@ -135,6 +135,25 @@ Pipeline stages:
 5. Quality gate.
 6. KG injection format.
 
+### Step 5: KG injection (host-side)
+
+Pipeline outputs `oracle-contracts.json` with a `kg_format` block but does
+NOT write the knowledge graph itself -- a Python process cannot cleanly call
+the host MCP server. After pipeline PASS, the agent reads
+`kg_format.entities` from the output file and pushes them by calling
+`mcp__knowledge-graph__create_entities` once with the full array. Relations
+are skipped intentionally (their `to` field is a file path, not an entity
+name; oracle queries hit observations directly via `mcp__knowledge-graph__search_nodes`).
+
+After a successful create, record the source file's sha256 in
+`.claude/state/oracle-kg-imported.json` so a pending-detection hook (when
+configured -- see `references/repomap-integration.md`) stops flagging the
+file as unimported.
+
+Skip Step 5 only when running in CI / headless mode where no MCP host is
+available. In that case the contracts JSON is still the durable artifact;
+a future agent session can import it.
+
 ## Mode 2: Query
 
 Input: files or repo-relative paths that will be edited.
