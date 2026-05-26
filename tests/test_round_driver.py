@@ -15,7 +15,7 @@ from pathlib import Path
 
 TESTS_DIR = Path(__file__).parent
 SCRIPTS_DIR = TESTS_DIR.parent / "scripts"
-TEMPLATES_DIR = TESTS_DIR.parent / "templates"
+TEMPLATES_DIR = SCRIPTS_DIR / "templates"
 FIXTURES = TESTS_DIR / "fixtures" / "multi_class_module"
 
 sys.path.insert(0, str(SCRIPTS_DIR))
@@ -203,6 +203,176 @@ class TestDriverEndToEnd(unittest.TestCase):
                     output_dir=Path(tmp),
                     templates_dir=TEMPLATES_DIR,
                 )
+
+
+class TestRenderNoDoublePass(unittest.TestCase):
+    """Phase D-mini fixup #1: _render must NOT regex-scan substituted
+    values. A value containing literal `{ident}` text (LLM prose, C#
+    initializers, Python f-strings) survives unchanged into the
+    rendered prompt.
+    """
+
+    def test_substituted_value_preserves_curly_idents(self):
+        body = "summary: {summary}\nend."
+        result = _render(body, summary="The handler sees {config} and {state}.")
+        # Both `{config}` and `{state}` came from the substituted value,
+        # not from the template -- they MUST be preserved verbatim.
+        self.assertIn("{config}", result)
+        self.assertIn("{state}", result)
+        # And the template placeholder was substituted exactly once.
+        self.assertNotIn("{summary}", result)
+
+    def test_missing_placeholder_still_marked(self):
+        # The fixup MUST preserve the missing-placeholder behaviour:
+        # a placeholder name not in kwargs becomes `(not provided)`.
+        result = _render("{a} -- {b}", a="present")
+        self.assertEqual(result, "present -- (not provided)")
+
+    def test_round_trip_substituted_then_no_replacement(self):
+        # If a substituted value happens to contain a placeholder name
+        # that ALSO appears in kwargs, that nested mention is NOT
+        # re-substituted -- one pass only.
+        result = _render("{summary}\n{summary_repeat}",
+                         summary="See {summary_repeat} below.",
+                         summary_repeat="(the appendix)")
+        # The substituted summary keeps its literal `{summary_repeat}`;
+        # only the template's own {summary_repeat} marker is replaced.
+        self.assertIn("See {summary_repeat} below.", result)
+        self.assertIn("(the appendix)", result)
+
+
+class TestGraphProviderUnknownType(unittest.TestCase):
+    """Phase D-mini fixup #2: unknown graph_provider.type raises
+    ValueError instead of silently returning (None, 'none')."""
+
+    def test_unknown_type_raises(self):
+        from oracle_config import normalize_config
+        cfg = normalize_config({"graph_provider": {"type": "repomap_l4"}})
+        with self.assertRaises(ValueError) as ctx:
+            _driver._make_graph_provider(cfg)
+        self.assertIn("repomap_l4", str(ctx.exception))
+        self.assertIn("Supported", str(ctx.exception))
+
+    def test_missing_type_returns_none(self):
+        # `type` absent (not configured) is legitimate -- not an error.
+        from oracle_config import normalize_config
+        cfg = normalize_config({})
+        provider, type_name = _driver._make_graph_provider(cfg)
+        self.assertIsNone(provider)
+        self.assertEqual(type_name, "none")
+
+
+class TestInternalCountAlwaysComputed(unittest.TestCase):
+    """Phase D-mini fixup #4+#6: internal_class_count is computed from
+    the source tree regardless of whether a graph provider is configured.
+    Previously the count was 0 when provider was None -- misleading the
+    user into thinking the module declared no types.
+    """
+
+    def test_no_provider_still_counts_types(self):
+        # multi_class_module fixture declares 10 types (4 in Controllers,
+        # 3 in Repositories, 2 in EventBus, 1 in Notifications).
+        evidence, internal_count, cross = _driver._build_evidence_pack(
+            provider_type="none",
+            provider=None,
+            module_name="AcmeWeb",
+            source_root=str(TESTS_DIR / "fixtures" / "multi_class_module"),
+        )
+        self.assertEqual(evidence, [])
+        self.assertEqual(cross, 0)
+        self.assertGreaterEqual(internal_count, 10,
+                                "source-tree walk should find all declared types")
+
+    def test_with_provider_reuses_file_to_symbols(self):
+        # When a provider is configured, the driver must not call
+        # index_source_tree a second time. We verify by checking the
+        # provider's _file_to_symbols is non-empty AFTER the driver
+        # ran (proving the first call populated it) and equals what
+        # the driver counted.
+        from repomap_bridge import RepoMapBridge
+        l3_path = str(TESTS_DIR / "fixtures" / "sample-l3.md")
+        source_root = str(TESTS_DIR / "fixtures" / "multi_class_module")
+        bridge = RepoMapBridge(l3_path)
+        _, internal_count, _ = _driver._build_evidence_pack(
+            "repomap_l3", bridge, "AcmeWeb", source_root,
+        )
+        # _file_to_symbols was populated by get_module_external_consumers
+        # and re-used (not re-walked); union of its values equals the
+        # internal_count reported.
+        union: set[str] = set()
+        for syms in bridge._file_to_symbols.values():
+            union.update(syms)
+        self.assertEqual(len(union), internal_count)
+        self.assertGreaterEqual(internal_count, 10)
+
+
+class TestSeedParserKeyByName(unittest.TestCase):
+    """Phase D-mini fixup #5+#7: Round 1 seed parser identifies file
+    and reason by KEY NAME (not position) and strips inline ` # ...`
+    comments before parsing.
+    """
+
+    def test_reversed_field_order(self):
+        text = "## candidate_seeds\n- reason: load-bearing, file: src/foo.cs\n"
+        r1 = Round1Artifact.from_llm_response(text)
+        self.assertEqual(len(r1.candidate_seeds), 1)
+        self.assertEqual(r1.candidate_seeds[0]["file"], "src/foo.cs")
+        self.assertEqual(r1.candidate_seeds[0]["reason"], "load-bearing")
+
+    def test_inline_comment_stripped(self):
+        text = "## candidate_seeds\n- file: src/main.go # entry point\n"
+        r1 = Round1Artifact.from_llm_response(text)
+        self.assertEqual(len(r1.candidate_seeds), 1)
+        # `# entry point` MUST be stripped before parsing
+        self.assertEqual(r1.candidate_seeds[0]["file"], "src/main.go")
+        self.assertNotIn("#", r1.candidate_seeds[0]["file"])
+
+    def test_inline_comment_then_reason(self):
+        text = "## candidate_seeds\n- file: foo.cs, reason: r  # comment here\n"
+        r1 = Round1Artifact.from_llm_response(text)
+        self.assertEqual(r1.candidate_seeds[0]["file"], "foo.cs")
+        self.assertEqual(r1.candidate_seeds[0]["reason"], "r")
+
+    def test_bare_path_still_works(self):
+        # Backwards-compat: no `file:` key, just a bare path.
+        text = "## candidate_seeds\n- src/foo.cs\n"
+        r1 = Round1Artifact.from_llm_response(text)
+        self.assertEqual(r1.candidate_seeds[0]["file"], "src/foo.cs")
+
+
+class TestRound2ParserProsePrefix(unittest.TestCase):
+    """Phase D-mini fixup #14: Round 2 parser locates JSON even when
+    prose precedes the fence or array."""
+
+    def test_prose_then_fenced_json(self):
+        text = ('Here is the contracts JSON:\n\n'
+                '```json\n[{"type": "rationale", "title": "X"}]\n```')
+        r2 = Round2Artifact.from_llm_response(text)
+        self.assertEqual(len(r2.contracts), 1)
+        self.assertEqual(r2.contracts[0]["type"], "rationale")
+
+    def test_prose_then_bare_array(self):
+        text = 'Sure thing! Here you go:\n[{"type": "ordering", "title": "Y"}]'
+        r2 = Round2Artifact.from_llm_response(text)
+        self.assertEqual(len(r2.contracts), 1)
+        self.assertEqual(r2.contracts[0]["type"], "ordering")
+
+    def test_prose_then_object_envelope(self):
+        text = 'Output:\n{"contracts": [{"type": "data_flow", "title": "Z"}]}'
+        r2 = Round2Artifact.from_llm_response(text)
+        self.assertEqual(len(r2.contracts), 1)
+        self.assertEqual(r2.contracts[0]["type"], "data_flow")
+
+    def test_strip_to_json_helper_picks_first_bracket(self):
+        # The helper picks min(find("["), find("{")). Prose followed by
+        # `{...}` envelope should be located correctly.
+        s = Round2Artifact._strip_to_json('text [a] then {b}')
+        self.assertTrue(s.startswith("["), f"got: {s!r}")
+
+    def test_truly_no_json_returns_empty(self):
+        r2 = Round2Artifact.from_llm_response("nothing json here at all")
+        self.assertEqual(r2.contracts, [])
+        self.assertEqual(r2.raw_response, "nothing json here at all")
 
 
 if __name__ == "__main__":

@@ -49,7 +49,11 @@ from round_artifacts import (
 
 
 REPO_ROOT = SCRIPT_DIR.parent
-DEFAULT_TEMPLATES_DIR = REPO_ROOT / "templates"
+# Templates live inside the scripts/ package so setuptools' package_data
+# can ship them in the wheel. Old repo-root location is kept as a fallback
+# for users who installed pre-fix and have templates at the old path.
+DEFAULT_TEMPLATES_DIR = SCRIPT_DIR / "templates"
+_LEGACY_TEMPLATES_DIR = REPO_ROOT / "templates"
 
 
 # ---------------------------------------------------------------------------
@@ -98,12 +102,43 @@ def _build_source_index(source_root: Path, max_entries: int = 200) -> str:
 def _build_evidence_pack(provider_type: str, provider, module_name: str,
                         source_root: str) -> tuple[list[dict], int, int]:
     """Run the graph provider and return (evidence_dicts, internal_count,
-    cross_edges). Both counts are 0 when no provider is configured.
+    cross_edges).
+
+    Two correctness fixes vs the original implementation:
+
+    1. internal_class_count is computed from the source tree REGARDLESS
+       of whether a graph provider is configured. The source tree is the
+       ground truth for "what does this module declare"; the graph
+       provider is one observation of that ground truth, not the
+       definition of it. Reporting 0 when no provider is configured
+       misled users into thinking the module had zero types.
+
+    2. When a provider IS configured, reuse its already-populated
+       `_file_to_symbols` map instead of calling index_source_tree a
+       second time. The first call -- inside
+       `get_module_external_consumers` -- already walks the tree;
+       calling it again wipes and re-populates the same map, doubling
+       the I/O cost for no information gain.
     """
     if provider is None:
-        return [], 0, 0
+        # No provider: walk the source tree directly so the driver's
+        # diagnostic counters still tell the truth about the module.
+        from repomap_bridge import _extract_top_level_symbols
+        internal: set[str] = set()
+        root = Path(source_root)
+        if root.is_dir():
+            for path in root.rglob("*"):
+                if path.is_file():
+                    internal.update(_extract_top_level_symbols(path))
+        return [], len(internal), 0
+
     externals = provider.get_module_external_consumers(module_name, source_root)
-    internal = provider.index_source_tree(source_root)
+    # `get_module_external_consumers` already called `index_source_tree`
+    # and populated `_file_to_symbols`; reuse it instead of re-walking.
+    file_to_symbols = getattr(provider, "_file_to_symbols", None) or {}
+    internal_symbols: set[str] = set()
+    for syms in file_to_symbols.values():
+        internal_symbols.update(syms)
     cross = sum(1 for e in externals if e.get("is_external"))
     evidence = [
         {
@@ -115,15 +150,23 @@ def _build_evidence_pack(provider_type: str, provider, module_name: str,
         for e in externals
         if e.get("is_external")
     ]
-    return evidence, len(internal), cross
+    return evidence, len(internal_symbols), cross
 
 
 def _make_graph_provider(cfg: dict):
     """Build the graph provider from config. Mirrors pipeline.py's logic
     so Round 0 and Stage 0 produce the same evidence shape.
+
+    Returns (provider, type_name) when configured, (None, "none") when
+    no `graph_provider` is set at all. Raises ValueError for an unknown
+    `type` value -- a typo like `repomap_l4` is a real user error and
+    silently falling back to "no provider" hides it (Phase D-mini lesson:
+    unimplemented-providers-must-exit). pipeline.py raises the same way.
     """
     gp = cfg.get("graph_provider") or {}
     gp_type = gp.get("type")
+    if not gp_type:
+        return None, "none"
     if gp_type == "repomap_l3":
         from repomap_bridge import RepoMapBridge
         path = resolve_config_path(cfg, ["graph_provider", "path"])
@@ -134,7 +177,10 @@ def _make_graph_provider(cfg: dict):
         from providers.grep_provider import GrepProvider
         repo_root = gp.get("repo_root") or cfg.get("_config_dir") or os.getcwd()
         return GrepProvider(repo_root=repo_root, include_dirs=gp.get("include_dirs")), "grep_fallback"
-    return None, "none"
+    raise ValueError(
+        f"Unknown graph_provider.type: {gp_type!r}. "
+        f"Supported: repomap_l3, grep_fallback."
+    )
 
 
 def _format_evidence_for_prompt(evidence: list[dict]) -> str:
@@ -172,17 +218,30 @@ def _load_template(templates_dir: Path, name: str) -> tuple[dict, str]:
     return frontmatter, body
 
 
+_PLACEHOLDER_RE = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
+
+
 def _render(template_body: str, **placeholders) -> str:
-    """Replace {name} placeholders. Missing placeholders become an
-    empty string -- the driver decides which keys to provide per round.
+    """Replace {name} placeholders in one pass.
+
+    Missing placeholders become `(not provided)`. The substitution is a
+    SINGLE pass over the template body; substituted values are not
+    re-scanned, so a value containing literal `{ident}` text (Round 2
+    LLM prose, seed source containing C# initializers / f-strings /
+    template literals) survives unchanged into the rendered prompt.
+
+    Previously this used a two-pass approach (str.replace per key, then
+    a global re.sub to wipe leftovers). The second pass walked over the
+    substituted output and silently corrupted any embedded `{ident}`
+    sequence -- the prompt the LLM saw was not the prompt the driver
+    thought it was sending.
     """
-    out = template_body
-    for key, value in placeholders.items():
-        out = out.replace("{" + key + "}", str(value))
-    # Strip any remaining placeholders so the LLM does not see literal
-    # `{foo}` markers. Two-pass regex catches anything not provided.
-    out = re.sub(r"\{[a-zA-Z_][a-zA-Z0-9_]*\}", "(not provided)", out)
-    return out
+    def sub(match: re.Match) -> str:
+        key = match.group(1)
+        if key in placeholders:
+            return str(placeholders[key])
+        return "(not provided)"
+    return _PLACEHOLDER_RE.sub(sub, template_body)
 
 
 # ---------------------------------------------------------------------------
@@ -374,7 +433,16 @@ def main():
 
     args = parser.parse_args()
 
-    templates_dir = Path(args.templates_dir).resolve() if args.templates_dir else DEFAULT_TEMPLATES_DIR
+    if args.templates_dir:
+        templates_dir = Path(args.templates_dir).resolve()
+    elif DEFAULT_TEMPLATES_DIR.is_dir():
+        templates_dir = DEFAULT_TEMPLATES_DIR
+    elif _LEGACY_TEMPLATES_DIR.is_dir():
+        # Backwards compat: pre-fixup installs that have templates at the
+        # repo root. New installs ship them inside the package.
+        templates_dir = _LEGACY_TEMPLATES_DIR
+    else:
+        templates_dir = DEFAULT_TEMPLATES_DIR  # for the not-found error below
     if not templates_dir.is_dir():
         print(f"Error: templates dir not found: {templates_dir}", file=sys.stderr)
         sys.exit(1)

@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "agent-code-oracle"
 version = "4.2.0"
@@ -27,3 +31,12 @@ oracle-scan = "scripts.incremental_scanner:main"
 oracle-sync = "scripts.oracle_sync:main"
 oracle-fresh = "scripts.freshness_checker:main"
 oracle-round-driver = "scripts.round_driver:main"
+
+[tool.setuptools]
+packages = ["scripts", "scripts.providers"]
+
+[tool.setuptools.package-data]
+# Templates live inside the scripts/ package so `pip install` ships them
+# alongside round_driver.py. Without this entry the wheel omits the
+# templates and `oracle-round-driver` fails with "templates dir not found".
+"scripts" = ["templates/*.txt"]
