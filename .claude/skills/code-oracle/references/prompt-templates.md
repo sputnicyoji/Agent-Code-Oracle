@@ -1,95 +1,93 @@
 # Prompt Templates
 
-> 4-round LLM dialogue for contract extraction
+> Language-neutral four-round dialogue for implicit contract extraction.
 
-## Round 0: L3 Cross-Module Discovery
+## Round 0: Static Provider Discovery
 
-**No LLM needed.** Parse RepoMap L3 reference graph to find cross-module consumers.
+Use a configured graph provider when available.
+The built-in provider is RepoMap L3:
 
 ```bash
 python scripts/repomap_bridge.py --l3 <l3_path> --module <name> --source-root <path>
 ```
 
-Prepend output to Round 1 prompt as context:
+Prepend provider output to Round 1 as evidence:
 
-```
-## Cross-Module Consumer Data (AST-verified)
+```text
+## External Consumer Evidence (static-provider verified)
 
-The following classes in this module are referenced by external modules:
+The following module symbols are referenced by external symbols:
 
-  PaymentGateway <- OrderService (inherits)
-  PaymentGateway <- InvoiceGenerator (inherits)
-  EventBus <- NotificationService (inherits)
+  src/payment/result.ts#PaymentResult <- src/invoice/generator.ts#createInvoice
+  src/payment/result.ts#PaymentResult <- src/audit/events.ts#recordPayment
 
-Pay special attention to these cross-module boundaries.
-Each external consumer is a candidate for a blast_radius contract.
+Use this as evidence for possible blast_radius contracts.
+Do not treat structural references as semantic consequences by themselves.
 ```
 
 ## Round 1: Architect's Eye
 
-```
-You are the original architect of this module. You have complete knowledge of:
-- Why every design decision was made
-- What implicit assumptions exist
-- What breaks if someone modifies code without full context
+```text
+You are analyzing this module as its original architect.
+You know the design intent, implicit assumptions, and downstream breakage risk.
 
-Analyze the provided source code and answer:
+Analyze the provided source and static-provider evidence.
+Answer:
 
-1. Complete data flow topology - how does data enter, transform, and exit this module?
-2. Implicit logic dependencies between components (not visible in imports)
-3. Data lifetime windows - which data is only valid in certain phases?
-4. Caller/callee implicit assumptions
+1. How does data enter, transform, and leave this module?
+2. Which assumptions are not local to one file?
+3. Which data shapes or states have validity windows?
+4. Who consumes this module's output?
+5. Which consequences cannot be inferred from direct imports/calls alone?
 
-MANDATORY QUESTION: "Who consumes this module's output?"
-List ALL external files/modules that read data produced by this module.
-Use the L3 cross-module data provided above as a starting point.
+Use repo-relative paths.
+Use symbols only when they clarify the path-level contract.
 ```
 
 ## Round 2: Contract Mining
 
-```
-Based on Round 1 analysis, extract implicit contracts as a JSON array.
+```text
+Extract implicit contracts as a JSON array.
 
-Each contract:
+Preferred schema:
 {
+  "schema_version": 2,
   "type": "blast_radius|rationale|data_flow|ordering|thread_safety",
-  "title": "English title (concise)",
-  "description": "Description of the implicit knowledge",
+  "title": "English title",
+  "description": "Project primary language description",
   "blind_spot": "Why an AI agent would miss this",
   "violation_consequence": "What breaks if violated",
-  "involved_files": ["File1.ext", "File2.ext"],
-  "affected_external_files": ["ExternalFile.ext"],  // optional
+  "scope": {"module": "<module>", "language": "<language-if-known>"},
+  "involved": [{"path": "repo/relative/path.ext", "symbols": ["OptionalSymbol"]}],
+  "affected_external": [{"path": "repo/relative/consumer.ext", "symbols": ["OptionalConsumer"]}],
+  "evidence": [{"kind": "static_reference|design_rationale|data_flow_trace", "source": "<source>", "target": "<path-or-symbol>"}],
   "confidence": 0.0-1.0
 }
 
-CONSTRAINTS:
-- blast_radius + rationale types must be >= 50% of total
-- Target: 15-30 contracts
-- Title in English, all other text fields in your project's primary language
-- involved_files: actual filenames (pipeline validates existence)
+Constraints:
+- blast_radius + rationale should meet the configured high-value ratio.
+- Target 15-30 contracts for large modules, fewer for small modules.
+- Use repo-relative paths, not basenames.
+- blast_radius contracts require source-backed evidence.
+- Do not emit language-specific fields unless they are metadata under scope.
 ```
 
 ## Round 3: Devil's Advocate
 
-```
-Review each contract with ONE criterion:
-"Could an AI agent reading all involved_files self-infer this?"
+```text
+Review each contract with one criterion:
+Could an AI agent infer this by reading all involved paths?
 
 Decision matrix:
-- Can infer from code alone -> DROP
-- Needs files outside the module -> KEEP (add those files to involved_files)
-- Needs business/historical context -> KEEP
-- Borderline (could infer with effort) -> DEMOTE (lower confidence to 0.3-0.5)
+- Can infer from local code alone -> DROP
+- Needs external consumers -> KEEP and include affected_external/evidence
+- Needs business/design/history context -> KEEP and include evidence/source
+- Borderline -> DEMOTE confidence to 0.3-0.5
 
-Special rules (from RED Phase findings):
-- thread_safety contracts about IJob vs IJobParallelFor choice -> usually DROP
-- rationale contracts that are actually about concurrency patterns -> DEMOTE
+Special rules:
+- Direct type/API constraints are usually DROP.
+- Pure ordering visible in one file is usually DROP.
+- Thread-safety visible from obvious locks/async/thread annotations is usually DEMOTE or DROP.
 
-Output: filtered JSON array with adjusted confidences.
-Target: 15-30 contracts after filtering.
+Output filtered JSON only.
 ```
-
-## L3 Data Injection Note (v4.0+)
-
-When Round 0 provides L3 consumer data, tell the LLM in Round 1:
-"The external consumer data above comes from AST static analysis and represents verified facts, not guesses. Use this data to answer 'who consumes this module's output'."

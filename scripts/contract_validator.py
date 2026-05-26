@@ -9,34 +9,68 @@ Validates contract format and reference integrity:
 5. confidence is in 0-1 range
 """
 
-import os
 from pathlib import Path
+
+from oracle_config import (
+    DEFAULT_EXCLUDE,
+    DEFAULT_INCLUDE,
+    build_file_index,
+    extract_contract_paths,
+    find_repo_root,
+    resolve_file_ref,
+    set_contract_paths,
+)
 
 
 VALID_TYPES = {"data_flow", "ordering", "rationale", "thread_safety", "blast_radius"}
 
-REQUIRED_FIELDS = {"type", "title", "description", "blind_spot", "violation_consequence", "involved_files", "confidence"}
+# Scalar required fields. The "paths" requirement (v1 `involved_files` OR v2
+# `involved`) is checked separately via the schema bridge so v2-only contracts
+# are not silently rejected for missing the legacy key.
+REQUIRED_SCALAR_FIELDS = {
+    "type", "title", "description",
+    "blind_spot", "violation_consequence", "confidence",
+}
+
+
+def _has_involved_paths(contract: dict) -> bool:
+    """True iff the contract carries at least one involved path in either schema."""
+    return bool(extract_contract_paths(contract, "involved_files"))
 
 
 class ContractValidator:
     """Contract format and reference validator"""
 
-    def __init__(self, source_root: str = None):
+    def __init__(
+        self,
+        source_root: str = None,
+        repo_root: str = None,
+        include: list[str] | None = None,
+        exclude: list[str] | None = None,
+    ):
         """
         Args:
             source_root: Source root directory (for validating involved_files existence)
         """
         self.source_root = source_root
-        self._file_cache = {}
+        self.repo_root = Path(repo_root).resolve() if repo_root else find_repo_root(source_root)
+        # Defensive copy: aliasing the module-level DEFAULT_INCLUDE/EXCLUDE
+        # lists means any caller's `.append(...)` would silently pollute every
+        # future instance in the same process.
+        self.include = list(include) if include is not None else list(DEFAULT_INCLUDE)
+        self.exclude = list(exclude) if exclude is not None else list(DEFAULT_EXCLUDE)
+        self._file_cache: dict[str, list[str]] = {}
         if source_root:
             self._build_file_cache(source_root)
 
     def _build_file_cache(self, root: str):
-        """Build filename -> path cache"""
-        for dirpath, _, filenames in os.walk(root):
-            for f in filenames:
-                if f.endswith(".cs"):
-                    self._file_cache[f] = os.path.join(dirpath, f)
+        """Build path/basename -> repo-relative path cache."""
+        self._file_cache = build_file_index(
+            [root],
+            repo_root=self.repo_root,
+            include=self.include,
+            exclude=self.exclude,
+        )
 
     def process(self, contracts: list[dict]) -> list[dict]:
         """
@@ -71,16 +105,28 @@ class ContractValidator:
         if contract.get("type") not in VALID_TYPES:
             errors.append(f"Invalid type: {contract.get('type')}. Must be one of {VALID_TYPES}")
 
-        # 2. Required fields
-        missing = REQUIRED_FIELDS - set(contract.keys())
+        # 2. Required scalar fields (schema-version-independent)
+        missing = REQUIRED_SCALAR_FIELDS - set(contract.keys())
         if missing:
             errors.append(f"Missing fields: {missing}")
 
+        # 2b. Involved paths: v1 (involved_files) OR v2 (involved) must yield
+        # at least one path through the schema bridge. v2-native contracts
+        # would previously fail the missing-fields check above; that key is
+        # no longer required so this is the authoritative paths check.
+        if not _has_involved_paths(contract):
+            errors.append(
+                "Missing involved paths (need 'involved' (v2) or 'involved_files' (v1))"
+            )
+
         # 3. involved_files existence
-        if self.source_root and "involved_files" in contract:
-            for f in contract["involved_files"]:
-                if f not in self._file_cache:
+        if self.source_root:
+            for f in extract_contract_paths(contract, "involved_files"):
+                matches = self._file_cache.get(f.replace("\\", "/")) or self._file_cache.get(Path(f).name)
+                if not matches:
                     errors.append(f"File not found: {f}")
+                elif len(matches) > 1 and f == Path(f).name:
+                    errors.append(f"Ambiguous basename, use repo-relative path: {f}")
 
         # 4. confidence range
         conf = contract.get("confidence")
@@ -95,18 +141,23 @@ class ContractValidator:
             return None
 
         # Remove non-existent files
-        if self.source_root and "involved_files" in contract:
-            valid_files = [f for f in contract["involved_files"] if f in self._file_cache]
-            contract["involved_files"] = valid_files
+        if self.source_root:
+            valid_files = []
+            for f in extract_contract_paths(contract, "involved_files"):
+                resolved = resolve_file_ref(f, self._file_cache)
+                if resolved:
+                    valid_files.append(resolved)
+            set_contract_paths(contract, valid_files, "involved_files")
 
-        # At least 1 valid file
-        if not contract.get("involved_files"):
+        # At least 1 valid path -- check through the bridge so v2 contracts
+        # whose paths live under `involved` (not `involved_files`) are kept.
+        if not _has_involved_paths(contract):
             return None
 
-        # Re-validate other fields
+        # Re-validate other fields (scalars only; paths already checked above)
         if contract.get("type") not in VALID_TYPES:
             return None
-        if REQUIRED_FIELDS - set(contract.keys()):
+        if REQUIRED_SCALAR_FIELDS - set(contract.keys()):
             return None
 
         return contract

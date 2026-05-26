@@ -15,6 +15,9 @@ Actual injection is done by Claude calling MCP tools (Python cannot call MCP dir
 """
 
 
+from oracle_config import extract_contract_paths
+
+
 class KGInjector:
     """Knowledge graph injection format converter"""
 
@@ -36,8 +39,8 @@ class KGInjector:
 
         for c in contracts:
             entity_name = f"{module_name}::{c['title']}"
-            involved = c.get("involved_files", [])
-            affected = c.get("affected_external_files", [])
+            involved = extract_contract_paths(c, "involved_files")
+            affected = extract_contract_paths(c, "affected_external_files")
 
             # Entity observations
             observations = [
@@ -57,6 +60,8 @@ class KGInjector:
                 observations.append(f"[external_consumer_count] {len(affected)}")
             if c.get("_l3_enriched"):
                 observations.append("[repomap_verified] Cross-module consumers verified by AST")
+            if c.get("evidence"):
+                observations.append(f"[evidence_count] {len(c.get('evidence') or [])}")
 
             entities.append({
                 "name": entity_name,

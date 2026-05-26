@@ -30,14 +30,29 @@ else
     PYTHON=python3
 fi
 
-FRESHNESS_SCRIPT="$REPO_ROOT/scripts/freshness_checker.py"
+SYNC_SCRIPT="$REPO_ROOT/scripts/oracle_sync.py"
 
-if [ ! -f "$FRESHNESS_SCRIPT" ]; then
+if [ ! -f "$SYNC_SCRIPT" ]; then
     exit 0
 fi
 
-echo "[Code Oracle] Running freshness check after merge..."
-$PYTHON "$FRESHNESS_SCRIPT" --config "$CONFIG" --since-merge 2>/dev/null
+echo "[Code Oracle] Running sync after merge..."
+
+# Log stderr to a file instead of /dev/null. Sync is advisory (we still exit 0)
+# but silently throwing away every error means a broken script -- import
+# error, missing module, NameError on a malformed contract -- goes undetected
+# until somebody notices reports stopped updating. The log file gives a
+# forensic trail without making the hook block the merge.
+LOG_DIR="$REPO_ROOT/.claude/context"
+mkdir -p "$LOG_DIR" 2>/dev/null
+LOG_FILE="$LOG_DIR/oracle-sync.log"
+
+$PYTHON "$SYNC_SCRIPT" --config "$CONFIG" --report "$LOG_DIR/oracle-sync-report.json" 2>>"$LOG_FILE"
+SYNC_RC=$?
+
+if [ $SYNC_RC -ne 0 ]; then
+    echo "[Code Oracle] sync exited rc=$SYNC_RC; see $LOG_FILE"
+fi
 
 # Always exit 0 — freshness check is advisory, not a gate
 exit 0

@@ -11,16 +11,33 @@ import subprocess
 import argparse
 from pathlib import Path
 
+from oracle_config import (
+    DEFAULT_EXCLUDE,
+    DEFAULT_INCLUDE,
+    extract_contract_paths,
+    is_included,
+    load_json_config,
+    normalize_config,
+)
+
 
 class IncrementalScanner:
     """Analyze impact of code changes on existing contracts"""
 
-    def __init__(self, l3_path: str = None, contracts_path: str = None):
+    def __init__(
+        self,
+        l3_path: str = None,
+        contracts_path: str = None,
+        include: list[str] = None,
+        exclude: list[str] = None,
+    ):
         self.bridge = None
         if l3_path:
             from repomap_bridge import RepoMapBridge
             self.bridge = RepoMapBridge(l3_path)
         self.contracts = self._load_contracts(contracts_path) if contracts_path else []
+        self.include = include or DEFAULT_INCLUDE
+        self.exclude = exclude or DEFAULT_EXCLUDE
 
     def _load_contracts(self, path: str) -> list[dict]:
         with open(path, "r", encoding="utf-8") as f:
@@ -30,7 +47,7 @@ class IncrementalScanner:
         return data if isinstance(data, list) else []
 
     def get_changed_files(self, commits: int = 1) -> list[str]:
-        """Get changed .cs files from git diff"""
+        """Get changed files from git diff using configured include/exclude globs."""
         try:
             # Find repo root dynamically
             root_result = subprocess.run(
@@ -48,8 +65,11 @@ class IncrementalScanner:
             if result.returncode != 0:
                 print(f"Warning: git diff failed: {result.stderr.strip()}")
                 return []
-            return [Path(f).name for f in result.stdout.splitlines()
-                    if f.endswith(".cs")]
+            return [
+                f.replace("\\", "/")
+                for f in result.stdout.splitlines()
+                if is_included(f, self.include, self.exclude)
+            ]
         except FileNotFoundError:
             print("Warning: git not found in PATH")
             return []
@@ -61,11 +81,18 @@ class IncrementalScanner:
         impact_chain = []
 
         for fname in changed_files:
-            matched = [
-                c for c in self.contracts
-                if fname in c.get("involved_files", [])
-                or fname in c.get("affected_external_files", [])
-            ]
+            base = Path(fname).name
+            matched = []
+            for c in self.contracts:
+                involved = set(extract_contract_paths(c, "involved_files"))
+                affected = set(extract_contract_paths(c, "affected_external_files"))
+                involved_basenames = {Path(p).name for p in involved}
+                affected_basenames = {Path(p).name for p in affected}
+                if (
+                    fname in involved or fname in affected
+                    or base in involved_basenames or base in affected_basenames
+                ):
+                    matched.append(c)
             if matched:
                 for c in matched:
                     affected_contracts.append({
@@ -80,8 +107,8 @@ class IncrementalScanner:
 
             # L3 impact chain
             if self.bridge:
-                class_name = fname.replace(".cs", "")
-                consumers = self.bridge.get_consumers(class_name)
+                symbol_name = Path(fname).stem
+                consumers = self.bridge.get_symbol_consumers(symbol_name)
                 if consumers:
                     impact_chain.append({
                         "source": fname,
@@ -137,9 +164,11 @@ def main():
     parser.add_argument("--commits", type=int, default=1, help="Commits to diff")
     parser.add_argument("--diff-files", nargs="+", help="Explicit changed .cs files")
     parser.add_argument("--output", help="Output JSON path")
+    parser.add_argument("--config", help="Path to oracle.config.json")
 
     args = parser.parse_args()
-    scanner = IncrementalScanner(args.l3, args.contracts)
+    cfg = normalize_config(load_json_config(args.config)) if args.config else normalize_config({})
+    scanner = IncrementalScanner(args.l3, args.contracts, cfg.get("include"), cfg.get("exclude"))
     changed = args.diff_files or scanner.get_changed_files(args.commits)
 
     if not changed:

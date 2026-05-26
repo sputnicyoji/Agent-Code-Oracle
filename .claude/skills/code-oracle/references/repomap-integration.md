@@ -1,51 +1,62 @@
-# RepoMap L3 Integration
+# Graph Provider Integration
 
-> L3 provides structural facts, Code Oracle adds semantic constraints
+> Static providers supply facts. Code Oracle adds semantic contracts.
 
-## Architecture
+## Provider Boundary
 
+```text
+static provider                 Code Oracle
+  symbols/references              LLM semantic extraction
+  changed paths                   deterministic pipeline
+  impact candidates               KG persistence
+       |                                 |
+       v                                 v
+provider adapter --------------> evidence fields
 ```
-RepoMap L3 (AST facts)           Code Oracle (semantic constraints)
-  tree-sitter parser               4-round LLM dialogue
-  PageRank ranking                 6-stage pipeline
-  git hook auto-sync               manual / incremental scan
-       |                                |
-       v                                v
-  repomap_bridge.py ---------> pipeline.py Stage 0
-  (instant struct query)        (L3 enrichment)
-       |                                |
-       v                                v
-  incremental_scanner.py        KG (code_contracts)
-  (git diff impact analysis)    (semantic-level constraints)
+
+## Built-in Provider: RepoMap L3
+
+RepoMap L3 is optional.
+It is one provider implementation, not the core design.
+
+```bash
+python scripts/repomap_bridge.py \
+  --l3 .claude/context/repomap-L3-relations.md \
+  --module MyModule \
+  --source-root src/MyModule/
 ```
+
+## Provider Interface
+
+Future providers should expose these concepts:
+
+```python
+get_external_consumers(symbol_or_path) -> list[Consumer]
+get_changed_symbols(diff) -> list[Symbol]
+get_high_impact_symbols(threshold) -> list[Symbol]
+```
+
+Use `symbol`, not `class`, in new interfaces.
+A symbol may be a function, class, struct, trait, module, route, proto message, table, or field.
 
 ## Complementary Layers
 
-| Question | L3 Provides | Code Oracle Adds |
-|----------|------------|-----------------|
-| "Who references X?" | inherits/implements (AST fact) | method calls, events, delegates |
-| "What breaks if I change X?" | structural impact scope | semantic consequences |
-| "Why is it designed this way?" | Nothing | rationale contracts |
-| "How does data flow?" | Nothing | data_flow contracts |
+| Question | Static provider provides | Code Oracle adds |
+|----------|--------------------------|------------------|
+| Who references X? | Structural facts | Which references are semantically risky |
+| What breaks if X changes? | Candidate impact scope | Consequence and blind spot |
+| Why is X designed this way? | Usually nothing | Rationale contract |
+| How does data flow? | Partial references | Cross-boundary semantic flow |
 
-## L3 Limitations
+## Known Provider Limits
 
-L3 does NOT capture:
-- Method-level call references
+Most static providers miss some of:
+
+- Runtime dynamic dispatch
 - Event subscriptions
 - Delegate/callback chains
 - Network message flows
-- Runtime dynamic dispatch
+- Configuration-to-code routing
+- Reflection or code generation
 
-These gaps are filled by Code Oracle's LLM analysis in Rounds 1-3.
-
-## Usage
-
-```bash
-# Pipeline with L3 enrichment
-python scripts/pipeline.py \
-  --input round3.json \
-  --module-name MyModule \
-  --source-root ./src/MyModule/ \
-  --repomap-l3 .claude/context/repomap-L3-relations.md
-```
+These gaps belong in Round 1-3 analysis and evidence notes.

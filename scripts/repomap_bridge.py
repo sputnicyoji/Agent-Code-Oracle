@@ -66,8 +66,12 @@ class RepoMapBridge:
                     })
 
     def get_consumers(self, class_name: str) -> list[dict]:
-        """Get all classes that inherit/implement this class"""
-        node = self.nodes.get(class_name)
+        """Get all consumers of a symbol. Kept for backward compatibility."""
+        return self.get_symbol_consumers(class_name)
+
+    def get_symbol_consumers(self, symbol_name: str) -> list[dict]:
+        """Get all known consumers of a symbol."""
+        node = self.nodes.get(symbol_name)
         if not node:
             return []
         return node["children"]
@@ -88,21 +92,31 @@ class RepoMapBridge:
     def get_module_external_consumers(
         self, module_name: str, source_root: str
     ) -> list[dict]:
-        """Get external consumers of a module's classes.
+        """Get external consumers of symbols defined under a module root.
 
         Args:
             module_name: Module name (unused directly, for logging)
-            source_root: Module source directory for building internal class set
+            source_root: Module source directory for building internal symbol set
 
         Returns:
             List of {class_name, consumer_name, relation_type, is_external}
         """
-        internal_classes = set()
+        # Build the set of module-internal symbol names by intersecting file
+        # stems with L3 graph nodes. The previous version added every file
+        # stem with any non-empty suffix (README.md -> "README", config.json
+        # -> "config", etc.), which then shadowed unrelated external symbols
+        # that happened to share a name and silently dropped their consumers
+        # from the external set.
+        internal_classes: set[str] = set()
         if source_root and os.path.isdir(source_root):
             for dirpath, _, filenames in os.walk(source_root):
                 for f in filenames:
-                    if f.endswith(".cs"):
-                        internal_classes.add(f.replace(".cs", ""))
+                    stem = Path(f).stem
+                    # Only treat a file stem as an internal symbol if the L3
+                    # graph actually has a node for it. Non-code files no
+                    # longer pollute the internal set.
+                    if stem in self.nodes:
+                        internal_classes.add(stem)
 
         results = []
         for cls_name, node in self.nodes.items():

@@ -103,7 +103,8 @@ cp -r scripts/ your-project/scripts/
 ```json
 {
   "project_name": "YourProject",
-  "file_extension": ".py",
+  "source_roots": ["src/"],
+  "include": ["**/*.py", "**/*.ts", "**/*.go", "**/*.rs", "**/*.cs"],
   "scanned_modules": {
     "PaymentService": {
       "source_root": "src/payment/",
@@ -157,7 +158,7 @@ python scripts/pipeline.py \
                         v (kg-injection.json)
 +--------------------------------------------------+
 |            Infrastructure Layer                  |
-|  RepoMap L3 Bridge (cross-module consumers)      |
+|  Graph provider adapter (cross-module consumers)      |
 |  Ollama bge-m3 (optional semantic dedup)         |
 |  Git hooks (post-merge freshness check)          |
 +--------------------------------------------------+
@@ -192,13 +193,13 @@ the ones that live only in institutional memory.
 
 ---
 
-## RepoMap L3 Integration
+## Graph Provider Integration
 
-RepoMap (from Aider) generates a file-level dependency graph. Code Oracle's L3 bridge
+A graph provider supplies structural dependency facts. Code Oracle's L3 bridge
 reads this graph to automatically enrich contracts with external consumers:
 
 ```
-PaymentProcessor.cs <-- used by --> OrderService.cs, InvoiceService.cs
+src/payment/result.ts <-- used by --> src/invoice/generator.ts, src/audit/events.ts
 ```
 
 This data is injected into `blast_radius` contracts as `affected_external_files`,

@@ -22,17 +22,51 @@ from contract_validator import ContractValidator
 from semantic_dedup import SemanticDedup
 from blind_spot_filter import BlindSpotFilter
 from kg_injector import KGInjector
+from oracle_config import (
+    DEFAULT_QUALITY_GATE,
+    extract_contract_paths,
+    load_json_config,
+    normalize_config,
+    set_contract_paths,
+)
+
+
+class QualityGateError(RuntimeError):
+    """Raised when contracts fail the configured quality gate.
+
+    `partial_contracts` carries the Stage 1-3 output so `--allow-warn` callers
+    can write the already-validated / deduped / filtered set, NOT the raw
+    pipeline input.
+    """
+
+    def __init__(self, failures: list[str], stats: dict,
+                 partial_contracts: list[dict] | None = None):
+        super().__init__("Quality gate failed: " + "; ".join(failures))
+        self.failures = failures
+        self.stats = stats
+        self.partial_contracts = partial_contracts or []
 
 
 class OraclePipeline:
     """Contract post-processing pipeline"""
 
     def __init__(self, module_name: str, source_root: str = None,
-                 dedup_threshold: float = 0.8, repomap_l3: str = None):
+                 dedup_threshold: float = 0.8, repomap_l3: str = None,
+                 repo_root: str = None, include: list[str] = None,
+                 exclude: list[str] = None, quality_gate: dict = None,
+                 allow_warn: bool = False):
         self.module_name = module_name
         self.source_root = source_root
         self.repomap_l3 = repomap_l3
-        self.validator = ContractValidator(source_root)
+        self.quality_gate = dict(DEFAULT_QUALITY_GATE)
+        self.quality_gate.update(quality_gate or {})
+        self.allow_warn = allow_warn
+        self.validator = ContractValidator(
+            source_root,
+            repo_root=repo_root,
+            include=include,
+            exclude=exclude,
+        )
         self.dedup = SemanticDedup(threshold=dedup_threshold)
         self.blind_spot_filter = BlindSpotFilter()
         self.injector = KGInjector()
@@ -66,25 +100,35 @@ class OraclePipeline:
             externals = bridge.get_module_external_consumers(
                 self.module_name, self.source_root
             )
-            # Preindex: class_name -> [consumer.cs]
+            # Preindex: symbol_name -> [consumer_symbol]
             consumer_index: dict[str, list[str]] = {}
             for e in externals:
                 if e["is_external"]:
                     consumer_index.setdefault(e["class_name"], []).append(
-                        e["consumer_name"] + ".cs"
+                        e["consumer_name"]
                     )
             for contract in contracts:
-                involved = contract.get("involved_files", [])
+                involved = extract_contract_paths(contract, "involved_files")
                 l3_consumers = []
                 for f in involved:
-                    cls = f.replace(".cs", "")
-                    l3_consumers.extend(consumer_index.get(cls, []))
+                    symbol = Path(f).stem
+                    l3_consumers.extend(consumer_index.get(symbol, []))
                 if l3_consumers:
-                    existing_ext = contract.get("affected_external_files", [])
-                    contract["affected_external_files"] = list(
-                        set(existing_ext + l3_consumers)
+                    # Read existing externals through the bridge so v2 contracts
+                    # that only have `affected_external` (not the v1
+                    # `affected_external_files` key) are not silently dropped
+                    # when we merge L3 consumers in.
+                    existing_ext = extract_contract_paths(
+                        contract, "affected_external_files"
                     )
+                    merged = sorted(set(existing_ext + l3_consumers))
+                    set_contract_paths(contract, merged, "affected_external_files")
                     contract["_l3_enriched"] = True
+                    contract.setdefault("evidence", []).append({
+                        "kind": "static_reference",
+                        "source": "repomap_l3",
+                        "target": ", ".join(sorted(set(l3_consumers))),
+                    })
             enriched = sum(1 for c in contracts if c.get("_l3_enriched"))
             print(f"  [OK] {enriched}/{len(contracts)} contracts enriched with L3 data\n")
 
@@ -106,8 +150,16 @@ class OraclePipeline:
         # Stage 4: Stats + Quality Gate
         print("[4/5] Stats + Quality Gate...")
         stats = self._compute_stats(filtered)
+        failures = self._quality_gate_failures(stats, filtered)
+        stats["quality_gate_pass"] = not failures
+        stats["quality_gate_failures"] = failures
         self._print_quality_gate(stats)
         print()
+
+        if failures and not self.allow_warn:
+            # Hand the caller the Stage 1-3 output so --allow-warn writes
+            # validated/deduped/filtered contracts rather than the raw input.
+            raise QualityGateError(failures, stats, partial_contracts=filtered)
 
         # Stage 5: KG Injection
         print("[5/5] KG Injection Format...")
@@ -156,6 +208,29 @@ class OraclePipeline:
             "demoted_contracts": demoted_titles,
         }
 
+    def _quality_gate_failures(self, stats: dict, contracts: list[dict]) -> list[str]:
+        gate = self.quality_gate
+        failures = []
+        if stats["effective"] < int(gate.get("min_effective", 0)):
+            failures.append(
+                f"effective contracts {stats['effective']} < {gate.get('min_effective')}"
+            )
+        if stats["total"] > int(gate.get("max_contracts", 10**9)):
+            failures.append(
+                f"total contracts {stats['total']} > {gate.get('max_contracts')}"
+            )
+        min_ratio = float(gate.get("min_high_value_ratio", 0))
+        if stats["p0_p1_ratio"] < min_ratio:
+            failures.append(
+                f"high-value ratio {stats['p0_p1_ratio']} < {min_ratio}"
+            )
+
+        require_evidence_for = set(gate.get("require_evidence_for", []) or [])
+        for c in contracts:
+            if c.get("type") in require_evidence_for and not c.get("evidence"):
+                failures.append(f"missing evidence for {c.get('type')}: {c.get('title')}")
+        return failures
+
     def _print_quality_gate(self, stats: dict) -> None:
         """Print quality gate results"""
         total = stats["total"]
@@ -165,17 +240,15 @@ class OraclePipeline:
         print(f"  Total: {total}, Effective (conf > 0.5): {effective}")
         print(f"  Avg confidence: {stats['avg_confidence']} (effective: {stats['avg_confidence_effective']})")
         print(f"  P0+P1 ratio: {p0_p1_ratio:.1%} [{stats['p0_p1_check']}]")
+        print(f"  Quality gate: {'PASS' if stats.get('quality_gate_pass') else 'FAIL'}")
 
         if stats["demoted_contracts"]:
             print(f"  Demoted contracts:")
             for line in stats["demoted_contracts"]:
                 print(line)
 
-        # Quality gate checks
-        if effective < 10:
-            print("  [WARN] Effective contracts < 10, consider re-scanning")
-        if total > 30:
-            print("  [WARN] Total > 30, Round 3 filtering may be too lenient")
+        for failure in stats.get("quality_gate_failures", []):
+            print(f"  [FAIL] {failure}")
 
 
 def main():
@@ -186,6 +259,8 @@ def main():
     parser.add_argument("--output", help="Output JSON path")
     parser.add_argument("--dedup-threshold", type=float, default=0.8, help="Dedup threshold")
     parser.add_argument("--repomap-l3", help="Path to repomap-L3-relations.md for L3 enrichment")
+    parser.add_argument("--config", help="Path to oracle.config.json")
+    parser.add_argument("--allow-warn", action="store_true", help="Write output even when quality gate fails")
 
     args = parser.parse_args()
 
@@ -207,14 +282,37 @@ def main():
         print("Error: Input must be JSON array or {contracts: [...]}", file=sys.stderr)
         sys.exit(1)
 
+    cfg = normalize_config(load_json_config(args.config)) if args.config else normalize_config({})
+    graph_provider = cfg.get("graph_provider") or {}
+    repomap_l3 = args.repomap_l3
+    if not repomap_l3 and graph_provider.get("type") == "repomap_l3":
+        repomap_l3 = graph_provider.get("path")
+
     # Run pipeline
     pipeline = OraclePipeline(
         module_name=args.module_name,
         source_root=args.source_root,
         dedup_threshold=args.dedup_threshold,
-        repomap_l3=args.repomap_l3,
+        repomap_l3=repomap_l3,
+        include=cfg.get("include"),
+        exclude=cfg.get("exclude"),
+        quality_gate=cfg.get("quality_gate"),
+        allow_warn=args.allow_warn,
     )
-    result = pipeline.process(contracts)
+    try:
+        result = pipeline.process(contracts)
+    except QualityGateError as exc:
+        print(str(exc), file=sys.stderr)
+        if not args.allow_warn:
+            sys.exit(2)
+        # Use the Stage 1-3 filtered contracts the exception carries -- writing
+        # the raw input here would silently undo validation, dedup, and the
+        # blind-spot filter.
+        result = {
+            "contracts": exc.partial_contracts,
+            "kg_format": {"entities": [], "relations": [], "context": "code_contracts"},
+            "stats": exc.stats,
+        }
 
     # Output
     if args.output:

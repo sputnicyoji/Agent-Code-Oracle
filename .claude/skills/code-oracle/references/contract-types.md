@@ -20,10 +20,10 @@
 ```json
 {
   "type": "blast_radius",
-  "title": "PaymentGateway output affects OrderService and InvoiceGenerator",
-  "description": "PaymentGateway.ProcessPayment() returns PaymentResult consumed by OrderService.FulfillOrder() and InvoiceGenerator.CreateReceipt()",
-  "blind_spot": "Developer modifying PaymentResult structure only considers PaymentGateway internals",
-  "violation_consequence": "OrderService fails to process orders, InvoiceGenerator generates corrupt invoices"
+  "title": "Producer output affects downstream consumers",
+  "description": "A producer emits a result shape consumed by downstream invoice and audit pipelines",
+  "blind_spot": "Developer modifying a result structure only considers producer internals",
+  "violation_consequence": "Downstream consumers lose or misread fields"
 }
 ```
 
@@ -90,3 +90,4 @@
 ## Quality Gate
 
 **blast_radius + rationale must be >= 50% of total contracts.** If your scan produces mostly ordering/thread_safety, Round 3 filtering was too lenient.
+

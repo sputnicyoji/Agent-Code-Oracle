@@ -45,7 +45,7 @@ used independently.
 |  scripts/pipeline.py                             |
 |                                                  |
 |  Stage 0: L3 Cross-Module Injection (optional)   |
-|    Input:  RepoMap L3 relations file             |
+|    Input:  optional graph provider output             |
 |    Action: Enrich blast_radius contracts with    |
 |            automatically discovered external     |
 |            consumers from the import graph       |
@@ -96,9 +96,9 @@ used independently.
 +--------------------------------------------------+
 |            Infrastructure Layer                  |
 |                                                  |
-|  RepoMap L3 Bridge (scripts/repomap_bridge.py)   |
-|    - Parses repomap-L3-relations.md              |
-|    - Builds class -> [consumer] index            |
+|  Graph Provider Adapter (repomap_bridge.py built-in)   |
+|    - Parses provider output              |
+|    - Builds symbol -> consumer index            |
 |    - Enriches contracts before Stage 1           |
 |                                                  |
 |  Ollama bge-m3 (optional)                        |
@@ -138,7 +138,7 @@ used independently.
 |    affects_external:  contract -> external_file  |
 |                                                  |
 |  Query patterns:                                 |
-|    By file:   search_nodes("PaymentProcessor")   |
+|    By file:   search_nodes("src/payment/result.ts")   |
 |    By type:   search_nodes("blast_radius")       |
 |    By module: open_nodes(["PaymentService_*"])   |
 +--------------------------------------------------+
@@ -172,22 +172,17 @@ Fields added by the pipeline:
 
 ---
 
-## RepoMap L3 Integration Detail
+## Graph Provider Integration Detail
 
-RepoMap generates a structured file that maps which classes reference which other classes.
-Code Oracle's `RepoMapBridge` parses this to answer: **"Who calls into this module?"**
+A graph provider supplies structural facts about which symbols or paths reference other symbols or paths.
+The provider adapter answers: **"Who consumes this module output?"**
 
 ```
-repomap-L3-relations.md format (Aider output):
-  src/payment/PaymentProcessor.py:
-    PaymentProcessor:
-      ProcessPayment() called by OrderService.ProcessOrder()
-      ProcessPayment() called by SubscriptionService.Renew()
+provider evidence example:
+  src/payment/result.ts#PaymentResult <- src/invoice/generator.ts#createInvoice
 ```
 
-The bridge builds an index `{class_name: [consumer_file]}` and joins it against
-`involved_files` in each contract. The result: `blast_radius` contracts automatically
-list which external files would need updates — without the LLM needing to search.
+The adapter joins provider facts against involved paths or symbols. The result enriches blast_radius contracts with affected_external and evidence.
 
 ---
 
@@ -243,3 +238,4 @@ freshness = 1.0 - (days_since_file_changed / 90)
 
 Contracts with freshness < 0.5 are flagged in the sync report. The post-merge hook
 writes this report to the path specified in `oracle.config.json` (`sync_report`).
+

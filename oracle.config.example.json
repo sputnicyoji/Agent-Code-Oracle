@@ -1,6 +1,8 @@
 {
   "project_name": "MyProject",
-  "file_extension": ".cs",
+  "source_roots": ["src/"],
+  "include": ["**/*.cs", "**/*.go", "**/*.ts", "**/*.tsx", "**/*.py", "**/*.rs"],
+  "exclude": ["**/generated/**", "**/vendor/**", "**/node_modules/**", "**/__pycache__/**"],
   "scanned_modules": {
     "PaymentService": {
       "source_root": "src/PaymentService/",
@@ -11,11 +13,19 @@
       "contract_output": "docs/contracts/user-auth.json"
     }
   },
-  "repomap_l3": ".claude/context/repomap-L3-relations.md",
+  "contract_paths": [
+    "docs/contracts/payment-service.json",
+    "docs/contracts/user-auth.json"
+  ],
+  "graph_provider": {
+    "type": "repomap_l3",
+    "path": ".claude/context/repomap-L3-relations.md"
+  },
   "sync_report": ".claude/context/oracle-sync-report.json",
-  "embedding": {
-    "enabled": true,
-    "model": "bge-m3",
-    "ollama_url": "http://localhost:11434"
+  "quality_gate": {
+    "min_effective": 5,
+    "max_contracts": 30,
+    "min_high_value_ratio": 0.5,
+    "require_evidence_for": ["blast_radius"]
   }
 }
