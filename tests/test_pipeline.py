@@ -475,5 +475,178 @@ class TestQualityGateProfilesInPipeline(unittest.TestCase):
         self.assertEqual(pipeline.quality_gate["min_high_value_ratio"], 0.5)
 
 
+class TestHashAutoFill(unittest.TestCase):
+    """Phase C #7: pipeline writes sha256 file_hashes for every involved /
+    affected path so freshness_checker can detect content drift."""
+
+    FIXTURES = Path(__file__).parent / "fixtures"
+
+    def _make(self, hash_involved=True):
+        return OraclePipeline(
+            module_name="Acme",
+            source_root=str(self.FIXTURES / "multi_class_module"),
+            hash_involved=hash_involved,
+            allow_warn=True,
+        )
+
+    def _contract(self, involved=None, affected=None):
+        return {
+            "schema_version": 2,
+            "type": "blast_radius",
+            "title": "T", "description": "d",
+            "blind_spot": "bs", "violation_consequence": "vc",
+            "confidence": 0.9,
+            "involved": [{"path": p} for p in (involved or ["Controllers.cs"])],
+            "affected_external": [{"path": p} for p in (affected or [])],
+        }
+
+    def test_hash_populated_for_existing_files(self):
+        result = self._make().process([self._contract(["Controllers.cs"])])
+        out_contracts = result["contracts"]
+        self.assertEqual(len(out_contracts), 1)
+        hashes = out_contracts[0].get("file_hashes")
+        self.assertIsInstance(hashes, dict)
+        # Validator normalises basenames to repo-relative paths during
+        # _try_fix; the hash key follows the normalised form. Either way,
+        # exactly one key ends in Controllers.cs and its value is a
+        # 64-char hex sha256.
+        ctrl_keys = [k for k in hashes if k.endswith("Controllers.cs")]
+        self.assertEqual(len(ctrl_keys), 1, f"unexpected hash keys: {list(hashes)}")
+        digest = hashes[ctrl_keys[0]]
+        self.assertEqual(len(digest), 64)
+        self.assertRegex(digest, r"^[0-9a-f]{64}$")
+
+    def test_hash_disabled_skips_field(self):
+        result = self._make(hash_involved=False).process(
+            [self._contract(["Controllers.cs"])]
+        )
+        out = result["contracts"][0]
+        self.assertNotIn("file_hashes", out)
+
+    def test_hash_skips_missing_files(self):
+        # Mix of resolvable + unresolvable paths. Validator drops the
+        # unresolvable one from involved_files via _try_fix; the hash
+        # step only hashes the resolvable one. Contract survives because
+        # at least one path remains.
+        result = self._make().process(
+            [self._contract(["Controllers.cs", "NotARealFile.cs"])]
+        )
+        out = result["contracts"][0]
+        hashes = out.get("file_hashes") or {}
+        self.assertTrue(any(k.endswith("Controllers.cs") for k in hashes))
+        self.assertFalse(any("NotARealFile.cs" in k for k in hashes))
+
+    def test_hash_includes_affected_external(self):
+        result = self._make().process(
+            [self._contract(involved=["Controllers.cs"],
+                            affected=["Repositories.cs"])]
+        )
+        hashes = result["contracts"][0]["file_hashes"]
+        self.assertTrue(any(k.endswith("Controllers.cs") for k in hashes))
+        self.assertTrue(any(k.endswith("Repositories.cs") for k in hashes))
+
+    def test_existing_hashes_preserved_for_missing_paths(self):
+        # If a contract already had a hash for a now-missing path, the
+        # pipeline keeps it in file_hashes even though validator removed
+        # the path from involved_files. Removing the hash entry would
+        # silently mask drift for renamed-but-still-tracked files.
+        c = self._contract(["Controllers.cs", "GoneFile.cs"])
+        c["file_hashes"] = {"GoneFile.cs": "deadbeef" * 8}
+        out = self._make().process([c])["contracts"][0]
+        # Pre-existing hash for a now-removed path is preserved.
+        self.assertEqual(out["file_hashes"]["GoneFile.cs"], "deadbeef" * 8)
+        # And the still-resolvable file got a fresh hash (under whatever
+        # key the validator's normalisation produced).
+        self.assertTrue(any(k.endswith("Controllers.cs") for k in out["file_hashes"]))
+
+
+class TestStrongEvidenceGate(unittest.TestCase):
+    """Phase C #8: require_strong_evidence_for fails contracts that only
+    cite design_rationale evidence. Default empty list = gate disabled."""
+
+    FIXTURES = Path(__file__).parent / "fixtures"
+
+    def _make(self, require_strong_for=None):
+        from oracle_config import DEFAULT_QUALITY_GATE
+        gate = dict(DEFAULT_QUALITY_GATE)
+        if require_strong_for is not None:
+            gate["require_strong_evidence_for"] = require_strong_for
+        # Soften ratio + effective minima so this test focuses on the
+        # strong-evidence gate alone.
+        gate["min_effective"] = 1
+        gate["min_high_value_ratio"] = 0.0
+        return OraclePipeline(
+            module_name="Acme",
+            source_root=str(self.FIXTURES / "multi_class_module"),
+            quality_gate=gate,
+            allow_warn=True,
+        )
+
+    def _blast_radius(self, evidence):
+        return {
+            "schema_version": 2,
+            "type": "blast_radius",
+            "title": "T", "description": "d",
+            "blind_spot": "bs", "violation_consequence": "vc",
+            "confidence": 0.9,
+            "involved": [{"path": "Controllers.cs"}],
+            "evidence": evidence,
+        }
+
+    def test_default_disabled_passes_design_rationale_only(self):
+        pipeline = self._make()  # default require_strong_evidence_for == []
+        c = self._blast_radius([{"kind": "design_rationale",
+                                  "source": "doc", "target": "ARCH.md"}])
+        result = pipeline.process([c])
+        self.assertTrue(result["stats"]["quality_gate_pass"],
+                        "default-disabled gate must let design_rationale through")
+
+    def test_enabled_fails_design_rationale_only(self):
+        pipeline = self._make(require_strong_for=["blast_radius"])
+        c = self._blast_radius([{"kind": "design_rationale",
+                                  "source": "doc", "target": "ARCH.md"}])
+        result = pipeline.process([c])
+        self.assertFalse(result["stats"]["quality_gate_pass"])
+        failures = result["stats"]["quality_gate_failures"]
+        self.assertTrue(any("design_rationale alone is insufficient" in f
+                            for f in failures))
+
+    def test_enabled_passes_with_static_reference(self):
+        pipeline = self._make(require_strong_for=["blast_radius"])
+        c = self._blast_radius([
+            {"kind": "design_rationale", "source": "doc", "target": "x"},
+            {"kind": "static_reference", "source": "graph",
+             "target": "Controllers.cs#BaseController"},
+        ])
+        result = pipeline.process([c])
+        self.assertTrue(result["stats"]["quality_gate_pass"])
+
+    def test_enabled_passes_with_code_comment(self):
+        pipeline = self._make(require_strong_for=["blast_radius"])
+        c = self._blast_radius([
+            {"kind": "code_comment", "source": "Controllers.cs:5",
+             "target": "// must come first"},
+        ])
+        result = pipeline.process([c])
+        self.assertTrue(result["stats"]["quality_gate_pass"])
+
+    def test_enabled_only_applies_to_listed_types(self):
+        # rationale contract with design_rationale-only evidence -- gate
+        # is configured for blast_radius only, so rationale passes.
+        pipeline = self._make(require_strong_for=["blast_radius"])
+        c = {
+            "schema_version": 2,
+            "type": "rationale",
+            "title": "T", "description": "d",
+            "blind_spot": "bs", "violation_consequence": "vc",
+            "confidence": 0.9,
+            "involved": [{"path": "Controllers.cs"}],
+            "evidence": [{"kind": "design_rationale",
+                          "source": "doc", "target": "x"}],
+        }
+        result = pipeline.process([c])
+        self.assertTrue(result["stats"]["quality_gate_pass"])
+
+
 if __name__ == "__main__":
     unittest.main()

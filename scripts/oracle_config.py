@@ -33,6 +33,15 @@ DEFAULT_QUALITY_GATE = {
     "max_contracts": 30,
     "min_high_value_ratio": 0.5,
     "require_evidence_for": ["blast_radius"],
+    # Phase C #8: opt-in evidence-strength ratchet. When a contract type is
+    # listed here, the gate demands at least one evidence entry whose kind
+    # is in STRONG_EVIDENCE_KINDS (static_reference / code_comment /
+    # data_flow_trace). `design_rationale` alone is insufficient. Default
+    # is empty -- enabling this on v4.3 install would fail every module
+    # whose contracts were extracted before evidence kinds were enforced.
+    # Users flip this on per-config after a rescan; recommended value is
+    # ["blast_radius"], documented in oracle.config.example.json.
+    "require_strong_evidence_for": [],
 }
 
 # Profile overrides for `quality_gate`. The default profile lets the gate

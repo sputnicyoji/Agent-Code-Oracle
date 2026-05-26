@@ -24,6 +24,24 @@ from oracle_config import (
 
 VALID_TYPES = {"data_flow", "ordering", "rationale", "thread_safety", "blast_radius"}
 
+# Evidence kind taxonomy (Phase C #8). The first three are "strong" because
+# they cite a source the agent can actually look at -- a reference graph
+# node, a code comment with file:line, a data-flow trace between
+# locations. `design_rationale` is "weak" because it appeals to context
+# the agent cannot directly verify (doc, ticket, conversation). The
+# quality gate's `require_strong_evidence_for` option uses this split.
+VALID_EVIDENCE_KINDS = {
+    "static_reference",
+    "code_comment",
+    "data_flow_trace",
+    "design_rationale",
+}
+STRONG_EVIDENCE_KINDS = {
+    "static_reference",
+    "code_comment",
+    "data_flow_trace",
+}
+
 # Scalar required fields. The "paths" requirement (v1 `involved_files` OR v2
 # `involved`) is checked separately via the schema bridge so v2-only contracts
 # are not silently rejected for missing the legacy key.
@@ -72,6 +90,21 @@ class ContractValidator:
             exclude=self.exclude,
         )
 
+    def resolve_absolute(self, file_ref: str) -> Path | None:
+        """Look up `file_ref` (repo-relative or basename) and return the
+        absolute filesystem path, or None when the file does not exist
+        under the validator's source root.
+
+        Public because the pipeline's hash step needs to read file content
+        for sha256; reusing this resolver avoids walking the source tree
+        a second time.
+        """
+        rel = resolve_file_ref(file_ref, self._file_cache)
+        if rel is None:
+            return None
+        p = (self.repo_root / rel)
+        return p if p.exists() else None
+
     def process(self, contracts: list[dict]) -> list[dict]:
         """
         Validate contract list
@@ -85,10 +118,17 @@ class ContractValidator:
         valid = []
         for i, c in enumerate(contracts):
             errors = self._validate(c, i)
-            if errors:
-                for err in errors:
-                    print(f"  [WARN] Contract #{i}: {err}")
-                # Try to fix: remove non-existent files and re-check
+            # Split: real validation errors (drop-worthy) vs evidence
+            # warnings (cosmetic). Evidence-only problems must NOT cause
+            # _try_fix to drop the contract.
+            structural = [e for e in errors if not e.startswith("evidence[")
+                          and not e.startswith("evidence must be a list")]
+            evidence_warnings = [e for e in errors if e not in structural]
+            for err in structural:
+                print(f"  [WARN] Contract #{i}: {err}")
+            for w in evidence_warnings:
+                print(f"  [WARN] Contract #{i}: {w}")
+            if structural:
                 original_title = c.get("title", "unknown")
                 c = self._try_fix(c)
                 if c is None:
@@ -133,7 +173,61 @@ class ContractValidator:
         if conf is not None and (not isinstance(conf, (int, float)) or conf < 0 or conf > 1):
             errors.append(f"Invalid confidence: {conf}. Must be 0-1")
 
+        # 5. evidence kind taxonomy. Warnings, not fatals: an unrecognised
+        # evidence entry indicates LLM drift but does not invalidate the
+        # contract -- the gate can still decide based on the remaining
+        # evidence entries.
+        for warn in self._validate_evidence(contract):
+            errors.append(warn)
+
         return errors
+
+    def _validate_evidence(self, contract: dict) -> list[str]:
+        """Check evidence[] for kind enum membership + per-kind shape.
+
+        Returns a list of warning strings (empty when all evidence is
+        well-formed). The caller treats these like other validation
+        errors but `_try_fix` does NOT drop a contract for evidence
+        problems -- evidence is supplemental.
+        """
+        warnings: list[str] = []
+        evidence = contract.get("evidence") or []
+        if not isinstance(evidence, list):
+            warnings.append(f"evidence must be a list, got {type(evidence).__name__}")
+            return warnings
+        for i, ev in enumerate(evidence):
+            if not isinstance(ev, dict):
+                warnings.append(f"evidence[{i}] is not an object")
+                continue
+            kind = ev.get("kind")
+            if kind is None:
+                warnings.append(f"evidence[{i}] missing 'kind'")
+                continue
+            if kind not in VALID_EVIDENCE_KINDS:
+                warnings.append(
+                    f"evidence[{i}] unknown kind {kind!r}. "
+                    f"Valid: {sorted(VALID_EVIDENCE_KINDS)}"
+                )
+                continue
+            # Per-kind shape checks. Keep these soft so a malformed entry
+            # is reported but does not block the rest of the pipeline.
+            if kind == "code_comment":
+                src = ev.get("source", "")
+                if not isinstance(src, str) or ":" not in src:
+                    warnings.append(
+                        f"evidence[{i}] code_comment 'source' should look "
+                        f"like 'file:line'; got {src!r}"
+                    )
+            elif kind == "static_reference":
+                tgt = ev.get("target", "")
+                if not isinstance(tgt, str) or "#" not in tgt:
+                    warnings.append(
+                        f"evidence[{i}] static_reference 'target' should look "
+                        f"like 'path#symbol'; got {tgt!r}"
+                    )
+            # data_flow_trace / design_rationale: free-form text on
+            # source/target; no extra shape check.
+        return warnings
 
     def _try_fix(self, contract: dict) -> dict | None:
         """Try to fix contract (remove non-existent files)"""

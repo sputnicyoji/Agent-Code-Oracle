@@ -26,7 +26,8 @@
     "min_effective": 5,
     "max_contracts": 30,
     "min_high_value_ratio": 0.5,
-    "require_evidence_for": ["blast_radius"]
+    "require_evidence_for": ["blast_radius"],
+    "require_strong_evidence_for": []
   },
   "quality_gate_profiles": {
     "default": { "min_high_value_ratio": 0.5 },

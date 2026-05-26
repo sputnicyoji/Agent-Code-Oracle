@@ -13,6 +13,7 @@ CLI:
     python pipeline.py --input round3.json --module-name MyModule --output result.json
 """
 
+import hashlib
 import json
 import os
 import sys
@@ -61,6 +62,8 @@ class OraclePipeline:
                  emit_legacy_kg_keys: bool = False,
                  graph_provider: dict = None,
                  repo_root_for_grep: str = None,
+                 hash_involved: bool = True,
+                 max_hash_bytes: int = 10 * 1024 * 1024,
                  allow_warn: bool = False):
         self.module_name = module_name
         self.source_root = source_root
@@ -69,6 +72,13 @@ class OraclePipeline:
         # supersedes the bare `repomap_l3` path argument.
         self.graph_provider = graph_provider or {}
         self.repo_root_for_grep = repo_root_for_grep
+        # Auto-hash settings. file_hashes is what freshness_checker reads
+        # to decide if an involved file has changed since the contract was
+        # extracted. Without it, freshness always reports FRESH; with it,
+        # any byte change in any involved/affected file flips the contract
+        # to STALE with `hash_changed` listing the file.
+        self.hash_involved = hash_involved
+        self.max_hash_bytes = max_hash_bytes
         # Base gate; per-profile overrides apply lazily in process() once we
         # know the auto-selected profile.
         self.quality_gate = dict(DEFAULT_QUALITY_GATE)
@@ -255,6 +265,12 @@ class OraclePipeline:
             # validated/deduped/filtered contracts rather than the raw input.
             raise QualityGateError(failures, stats, partial_contracts=filtered)
 
+        # Stage 4.5: hash involved files so freshness_checker can detect
+        # content drift later. The step is silent when hash_involved is
+        # False or no contracts had resolvable files.
+        if self.hash_involved:
+            self._hash_files(filtered)
+
         # Stage 5: KG Injection
         print("[5/5] KG Injection Format...")
         kg_format = self.injector.convert(filtered, self.module_name)
@@ -307,6 +323,45 @@ class OraclePipeline:
         if self._stage0_diagnostics:
             stats.update(self._stage0_diagnostics)
         return stats
+
+    def _hash_files(self, contracts: list[dict]) -> None:
+        """Populate `contract['file_hashes']` with sha256 of involved and
+        affected paths. Skip files over `self.max_hash_bytes` and files
+        the validator could not resolve (deleted, ignored by include
+        globs, etc.). Existing `file_hashes` keys are preserved when the
+        file is unresolvable now -- removing them would silently mask
+        already-tracked staleness for paths that just got renamed.
+        """
+        hashed_total = 0
+        for contract in contracts:
+            existing = contract.get("file_hashes") or {}
+            hashes: dict[str, str] = dict(existing) if isinstance(existing, dict) else {}
+            paths: list[str] = []
+            paths.extend(extract_contract_paths(contract, "involved_files"))
+            paths.extend(extract_contract_paths(contract, "affected_external_files"))
+            for rel in paths:
+                abs_path = self.validator.resolve_absolute(rel)
+                if abs_path is None:
+                    continue
+                try:
+                    size = abs_path.stat().st_size
+                except OSError:
+                    continue
+                if size > self.max_hash_bytes:
+                    continue
+                h = hashlib.sha256()
+                try:
+                    with open(abs_path, "rb") as f:
+                        for chunk in iter(lambda: f.read(1 << 20), b""):
+                            h.update(chunk)
+                except OSError:
+                    continue
+                hashes[rel] = h.hexdigest()
+                hashed_total += 1
+            if hashes:
+                contract["file_hashes"] = hashes
+        if hashed_total:
+            print(f"  [hash] sha256 written for {hashed_total} file references")
 
     def _make_provider(self):
         """Construct the graph provider for Stage 0, or None when none
@@ -382,6 +437,31 @@ class OraclePipeline:
         for c in contracts:
             if c.get("type") in require_evidence_for and not c.get("evidence"):
                 failures.append(f"missing evidence for {c.get('type')}: {c.get('title')}")
+
+        # Phase C #8: strong-evidence ratchet. design_rationale-only
+        # evidence is insufficient for the configured types. Imported
+        # lazily to avoid a hard dependency on contract_validator at
+        # module import time (process() already needs it; this is just
+        # the symbol).
+        require_strong_for = set(gate.get("require_strong_evidence_for", []) or [])
+        if require_strong_for:
+            from contract_validator import STRONG_EVIDENCE_KINDS
+            for c in contracts:
+                if c.get("type") not in require_strong_for:
+                    continue
+                evidence = c.get("evidence") or []
+                has_strong = any(
+                    isinstance(ev, dict)
+                    and ev.get("kind") in STRONG_EVIDENCE_KINDS
+                    for ev in evidence
+                )
+                if not has_strong:
+                    failures.append(
+                        f"{c.get('type')} contract '{c.get('title')}' needs "
+                        f"at least one evidence entry with kind in "
+                        f"{sorted(STRONG_EVIDENCE_KINDS)} "
+                        f"(design_rationale alone is insufficient)"
+                    )
         return failures
 
     def _print_quality_gate(self, stats: dict) -> None:
@@ -424,6 +504,11 @@ def main():
         help="Also emit the pre-v4.2 aggregated [involved_files] / "
              "[affected_external_files] observation lines for KG queries "
              "that still target the old format.",
+    )
+    parser.add_argument(
+        "--no-hash-involved", action="store_true",
+        help="Skip the sha256 step. Without it freshness_checker cannot "
+             "detect content drift, only file deletion.",
     )
 
     args = parser.parse_args()
@@ -481,6 +566,7 @@ def main():
         emit_legacy_kg_keys=args.emit_legacy_kg_keys,
         graph_provider=graph_provider,
         repo_root_for_grep=repo_root_for_grep,
+        hash_involved=not args.no_hash_involved,
         allow_warn=args.allow_warn,
     )
     try:
